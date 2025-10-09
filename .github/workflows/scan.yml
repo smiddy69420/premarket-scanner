@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - env:
+            - env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          FORCE_RUN: "1"   # <— manual runs post immediately
-        run: python scanner.py
+        run: python webhook_runner.py
+
