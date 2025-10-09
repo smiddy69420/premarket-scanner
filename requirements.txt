@@ -4,3 +4,4 @@ numpy
 ta
 requests
 pytz
+discord.py==2.3.2
