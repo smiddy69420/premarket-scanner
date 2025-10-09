@@ -22,7 +22,8 @@ jobs:
           pip install yfinance pandas numpy ta requests pytz
 
       - name: 🚀 Run scanner
-      - env:
+        env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: python webhook_runner.py
+
 
