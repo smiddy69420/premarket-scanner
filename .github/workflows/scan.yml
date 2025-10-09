@@ -1,7 +1,7 @@
 name: premarket-scan
 on:
   schedule:
-    # 09:15 ET ≈ 13:15 UTC during EDT; also 14:15 to cover DST shifts
+    # 09:15 ET ≈ 13:15 UTC during EDT; add 14:15 to straddle DST
     - cron: "15 13 * * 1-5"
     - cron: "15 14 * * 1-5"
   workflow_dispatch:
@@ -16,4 +16,5 @@ jobs:
       - run: pip install -r requirements.txt
       - env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          FORCE_RUN: "1"   # <— manual runs post immediately
         run: python scanner.py
