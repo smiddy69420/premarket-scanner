@@ -1,11 +1,10 @@
-# webhook_runner.py — pretty embeds for GitHub/cron posts
 import os, requests
 from scanner_core import run_scan
 
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK","")
 
 def color_for(bias):
-    return 0x2ecc71 if bias=="CALL" else 0xe74c3c  # green/red
+    return 0x2ecc71 if bias=="CALL" else 0xe74c3c
 
 def chunk_embeds(embeds, size=10):
     for i in range(0, len(embeds), size):
@@ -35,6 +34,8 @@ def build_embeds(df, title="Premarket Ranked Scan"):
     return embeds
 
 def main():
+    if not WEBHOOK:
+        print("Missing DISCORD_WEBHOOK"); return
     df, meta = run_scan(top_k=10)
     if df.empty:
         requests.post(WEBHOOK, json={"content":"**📣 Premarket Scan**\n_No candidates today._"}); 
@@ -45,3 +46,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
