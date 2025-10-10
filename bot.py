@@ -13,19 +13,18 @@ from ta.momentum import RSIIndicator
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Local modules
-from scanner_core import run_scan            # your existing multi-ticker scan (already in repo)
-import history                                # our tiny SQLite helper
+from scanner_core import run_scan            # your multi-ticker scanner
+import history                                # tiny SQLite logger
 
 TOKEN    = os.environ.get("DISCORD_TOKEN")
-GUILD_ID = os.environ.get("GUILD_ID")  # optional for instant slash sync (your server's 18-digit ID)
+GUILD_ID = os.environ.get("GUILD_ID")  # optional for instant slash sync
 
-# Universe for /earnings_watch (±7 days)
 DEFAULT_UNIVERSE = [
     "SPY","QQQ","AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","NFLX","AMD",
     "BA","COST","WMT","ORCL","KO","PEP","CRM","SHOP","MS","JPM","PYPL","DIS","INTC","UNH","T"
 ]
 
-# ---------- helpers ----------
+# ----------------------- helpers -----------------------
 def color_for(bias: str) -> int:
     return 0x2ecc71 if str(bias).upper() == "CALL" else 0xe74c3c
 
@@ -35,14 +34,73 @@ def fmt_usd(x) -> str:
     except:
         return str(x)
 
+async def to_thread(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures single-level, human-readable column names:
+    - For MultiIndex: join levels with '|'
+    - Remove duplicate columns (keep first)
+    - Normalize whitespace/case lightly
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = [
+            "|".join([str(x) for x in tup if x is not None and str(x) != ""])
+            for tup in df.columns.to_list()
+        ]
+    else:
+        df = df.copy()
+        df.columns = [str(c) for c in df.columns]
+    # drop dups while preserving order
+    df = df.loc[:, ~pd.Index(df.columns).duplicated(keep="first")]
+    return df
+
+def _to_series(obj, index=None, name="x") -> pd.Series:
+    """
+    Convert any Close/Volume object to a 1-D numeric Series.
+    Accepts Series, 1-col DataFrame, numpy arrays (n or n,1).
+    """
+    if isinstance(obj, pd.Series):
+        s = obj
+    elif isinstance(obj, pd.DataFrame):
+        if obj.shape[1] == 0:
+            raise ValueError(f"{name} DataFrame has no columns")
+        s = obj.iloc[:, 0]
+    else:
+        arr = np.asarray(obj).reshape(-1)
+        s = pd.Series(arr, index=index[:len(arr)] if index is not None else None, name=name)
+    return pd.to_numeric(s, errors="coerce")
+
+def _find_column(df: pd.DataFrame, candidates) -> pd.Series | None:
+    """
+    Try multiple name patterns to find a column.
+    Examples of candidates: ['close','adj close','*|close']
+    """
+    cols = list(df.columns)
+    lowmap = {c.lower(): c for c in cols}
+
+    # 1) exact (case-insensitive)
+    for cand in candidates:
+        lc = cand.lower()
+        if lc in lowmap:
+            return _to_series(df[lowmap[lc]], index=df.index, name=lowmap[lc])
+
+    # 2) contains (case-insensitive)
+    for cand in candidates:
+        lc = cand.lower()
+        for c in cols:
+            if lc in c.lower():
+                return _to_series(df[c], index=df.index, name=c)
+
+    return None
+
 def nearest_strike(series, spot):
     diffs = (series.astype(float) - float(spot)).abs()
     return int(diffs.sort_values().index[0])
 
-async def to_thread(func, *args, **kwargs):
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-# ---------- options picker ----------
+# ----------------------- options picker -----------------------
 def pick_option(symbol: str, spot: float, bias: str):
     """
     Choose an expiry ~7–21 DTE if available, ATM strike, compute mid & spread.
@@ -54,12 +112,10 @@ def pick_option(symbol: str, spot: float, bias: str):
             return {"note": "No options listed."}
 
         today = dt.datetime.utcnow().date()
-
         def dte(e):
             ed = dt.datetime.strptime(e, "%Y-%m-%d").date()
             return (ed - today).days
 
-        # Prefer around 10 DTE; if none, pick nearest
         sorted_exps = sorted(expiries, key=lambda e: abs(max(dte(e), 0) - 10))
         expiry = sorted_exps[0]
 
@@ -89,13 +145,10 @@ def pick_option(symbol: str, spot: float, bias: str):
     except Exception as e:
         return {"note": f"Option lookup error: {e}"}
 
-# ---------- news & sentiment ----------
+# ----------------------- news & earnings -----------------------
 _SID = SentimentIntensityAnalyzer()
 
 def news_sentiment(symbol: str, limit=5):
-    """
-    Pull recent Yahoo Finance news and score titles with VADER.
-    """
     t = yf.Ticker(symbol)
     try:
         items = t.get_news() or []
@@ -114,11 +167,7 @@ def news_sentiment(symbol: str, limit=5):
     avg = round(sum(s for _,_,s in scored)/len(scored), 3)
     return {"avg": avg, "items": scored}
 
-# ---------- earnings watch (±7 days) ----------
 def earnings_within_7d(symbol: str):
-    """
-    Returns list of (date, days_from_now) within +/- 7 days, else [].
-    """
     try:
         t = yf.Ticker(symbol)
         df = t.get_earnings_dates(limit=6)
@@ -135,59 +184,51 @@ def earnings_within_7d(symbol: str):
     except Exception:
         return []
 
-# ---------- single-ticker analysis (fixed: always 1-D) ----------
+# ----------------------- single-ticker analysis -----------------------
 def analyze_symbol(symbol: str):
     """
     Returns dict with price, bias, buy_range, target, stop, indicators, and an option suggestion.
-    Uses ~5d/5m data. Robust to MultiIndex/2D columns from yfinance.
+    Uses ~5d/5m data and **forces 1-D** Close/Volume with resilient column detection.
     """
     try:
         d = yf.download(symbol, period="5d", interval="5m", auto_adjust=True, progress=False)
         if d is None or len(d) == 0:
             return {"ok": False, "error": "No data."}
 
-        # --- normalize columns to 1-D Series ---
-        def to_1d_series(obj, name: str):
-            """
-            Ensures a pandas Series (1-D). Handles DataFrame (n,1), MultiIndex, or numpy arrays.
-            """
-            if obj is None:
-                raise ValueError(f"{name} missing")
-            if isinstance(obj, pd.DataFrame):
-                # if single column DF, take the first column
-                if obj.shape[1] >= 1:
-                    ser = obj.iloc[:, 0]
-                else:
-                    raise ValueError(f"{name} DataFrame has no columns")
-            elif isinstance(obj, pd.Series):
-                ser = obj
-            else:
-                # numpy array or other: flatten into Series, try to use d.index for alignment
-                arr = np.asarray(obj).reshape(-1)
-                ser = pd.Series(arr, index=d.index[:len(arr)], name=name)
-            return pd.to_numeric(ser, errors="coerce")
+        d = _flatten_columns(d)
 
-        # Support both normal and MultiIndex (('NVDA','Close')) shapes
-        if isinstance(d.columns, pd.MultiIndex):
-            close_raw  = d.xs("Close",  axis=1, level=-1, drop_level=False)
-            volume_raw = d.xs("Volume", axis=1, level=-1, drop_level=False)
-        else:
-            close_raw  = d.get("Close")
-            volume_raw = d.get("Volume")
+        # Try typical names; handle odd ones like "NVDA|Close", "Adj Close", etc.
+        close = _find_column(d, ["close", "adj close", "nvda|close", "tsla|close", "aapl|close"])
+        vol   = _find_column(d, ["volume", "nvda|volume", "tsla|volume", "aapl|volume"])
 
-        close  = to_1d_series(close_raw,  "Close")
-        volume = to_1d_series(volume_raw, "Volume")
+        # Fallback: attempt last-resort MultiIndex xs (if any were missed)
+        if close is None or vol is None:
+            try:
+                # if original was MultiIndex, xs might still work
+                if isinstance(yf.download(symbol, period="1d", interval="1d", progress=False).columns, pd.MultiIndex):
+                    d_mi = yf.download(symbol, period="5d", interval="5m", auto_adjust=True, progress=False)
+                    close = close or _to_series(d_mi.xs("Close", axis=1, level=-1, drop_level=False).iloc[:,0], index=d_mi.index, name="Close")
+                    vol   = vol   or _to_series(d_mi.xs("Volume",axis=1, level=-1, drop_level=False).iloc[:,0], index=d_mi.index, name="Volume")
+            except Exception:
+                pass
 
-        # Drop NaNs
+        if close is None:
+            return {"ok": False, "error": f"'Close' not found. Columns seen: {list(d.columns)[:10]}…"}
+        if vol is None:
+            # volume is optional but recommended; if missing, create NaNs of same length
+            vol = pd.Series([np.nan]*len(close), index=close.index, name="Volume")
+
+        # clean
         mask = close.notna()
         close = close[mask]
-        volume = volume[mask]
+        vol   = vol.reindex(close.index)
         if len(close) < 60:
             return {"ok": False, "error": "Not enough recent data for indicators."}
 
         last_close = float(close.iloc[-1])
-        avg_vol20  = float(volume.tail(20).mean()) if volume.notna().any() else np.nan
+        avg_vol20  = float(vol.tail(20).mean()) if vol.notna().any() else np.nan
 
+        # indicators (guaranteed 1-D Series)
         ema20 = EMAIndicator(close, window=20).ema_indicator()
         ema50 = EMAIndicator(close, window=50).ema_indicator()
         rsi   = RSIIndicator(close, window=14).rsi()
@@ -206,7 +247,7 @@ def analyze_symbol(symbol: str):
         else:
             bias = "CALL" if (float(macd_diff.iloc[-1]) > 0 and float(rsi.iloc[-1]) >= 50) else "PUT"
 
-        # Simple trade plan (~0.20% bands)
+        # trade bands (~0.20%)
         pct = 0.002
         if bias == "CALL":
             buy_low, buy_high = last_close * (1 - pct), last_close * (1 - pct/2)
@@ -220,7 +261,7 @@ def analyze_symbol(symbol: str):
         reasons = []
         reasons.append(f"Trend: {'Up' if uptrend else ('Down' if downtrend else 'Mixed')} (Close {fmt_usd(last_close)} vs EMA20/EMA50)")
         reasons.append(f"MACD diff: {float(macd_diff.iloc[-1]):.3f} | RSI: {float(rsi.iloc[-1]):.1f}")
-        if not np.isnan(avg_vol20) and float(volume.iloc[-1]) > avg_vol20:
+        if not np.isnan(avg_vol20) and vol.notna().any() and float(vol.iloc[-1]) > avg_vol20:
             reasons.append("Moderate volume")
 
         opt = pick_option(symbol, last_close, bias)
@@ -239,7 +280,7 @@ def analyze_symbol(symbol: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- Discord client ----------
+# ----------------------- Discord client & commands -----------------------
 class ScannerBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -247,9 +288,7 @@ class ScannerBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # create DB table
         history.init_db()
-        # fast guild sync if provided
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -263,12 +302,10 @@ client = ScannerBot()
 async def on_ready():
     print(f"✅ Logged in as {client.user} (latency {client.latency*1000:.0f} ms)")
 
-# ---- health ----
 @client.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 pong", ephemeral=True)
 
-# ---- HELP ----
 @client.tree.command(name="help", description="How to use the scanner & read signals.")
 async def help_cmd(interaction: discord.Interaction):
     e = discord.Embed(
@@ -291,7 +328,6 @@ async def help_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=e, ephemeral=True)
 
-# ---- SCAN NOW (uses your scanner_core.run_scan) ----
 @client.tree.command(name="scan_now", description="Run the options scanner and post top picks.")
 async def scan_now(interaction: discord.Interaction):
     deferred = False
@@ -301,7 +337,6 @@ async def scan_now(interaction: discord.Interaction):
     except Exception:
         pass
 
-    # Run your core scan in a worker thread
     df, meta = await to_thread(run_scan, 10)
 
     embeds = []
@@ -312,7 +347,6 @@ async def scan_now(interaction: discord.Interaction):
     )
     embeds.append(header)
 
-    # Post picks + log history
     if not df.empty:
         for _, r in df.iterrows():
             e = discord.Embed(
@@ -335,7 +369,6 @@ async def scan_now(interaction: discord.Interaction):
                 e.add_field(name="Option", value=str(r["Opt Note"]), inline=False)
             embeds.append(e)
 
-            # log to history
             try:
                 history.log_signal(
                     source="scan_now",
@@ -350,7 +383,6 @@ async def scan_now(interaction: discord.Interaction):
             except Exception:
                 traceback.print_exc()
 
-    # send
     try:
         for i in range(0, len(embeds), 10):
             if deferred:
@@ -360,7 +392,6 @@ async def scan_now(interaction: discord.Interaction):
     except Exception:
         await interaction.channel.send("Scan posted.")
 
-# ---- SCAN TICKER ----
 @client.tree.command(name="scan_ticker", description="Analyze a single ticker (e.g., NVDA)")
 @app_commands.describe(symbol="Ticker symbol, e.g., NVDA")
 async def scan_ticker(interaction: discord.Interaction, symbol: str):
@@ -371,7 +402,7 @@ async def scan_ticker(interaction: discord.Interaction, symbol: str):
 
     res = await to_thread(analyze_symbol, symbol.upper())
     if not res.get("ok"):
-        await interaction.followup.send(f"❌ Could not analyze **{symbol}**: {res.get('error','unknown error')}")
+        await interaction.followup.send(f"❌ Could not analyze **{symbol.upper()}**: {res.get('error','unknown error')}")
         return
 
     e = discord.Embed(
@@ -395,7 +426,6 @@ async def scan_ticker(interaction: discord.Interaction, symbol: str):
 
     await interaction.followup.send(embed=e)
 
-    # log to history
     try:
         history.log_signal(
             source="scan_ticker",
@@ -410,7 +440,6 @@ async def scan_ticker(interaction: discord.Interaction, symbol: str):
     except Exception:
         traceback.print_exc()
 
-# ---- EARNINGS WATCH (±7 days) ----
 @client.tree.command(name="earnings_watch", description="Show universe with earnings within ±7 days")
 async def earnings_watch(interaction: discord.Interaction):
     try:
@@ -428,7 +457,7 @@ async def earnings_watch(interaction: discord.Interaction):
         await interaction.followup.send("No earnings within ±7 days for the current universe.")
         return
 
-    rows.sort(key=lambda x: abs(x[2]))  # closest first
+    rows.sort(key=lambda x: abs(x[2]))
     desc = []
     for tkr, when, diff in rows[:20]:
         tag = "🟢 in" if diff >= 0 else "🔴 was"
@@ -440,7 +469,6 @@ async def earnings_watch(interaction: discord.Interaction):
     )
     await interaction.followup.send(embed=e)
 
-# ---- NEWS SENTIMENT ----
 @client.tree.command(name="news_sentiment", description="Headline sentiment snapshot (last ~5)")
 @app_commands.describe(symbol="Ticker symbol, e.g., TSLA")
 async def news_sentiment_cmd(interaction: discord.Interaction, symbol: str):
@@ -463,7 +491,6 @@ async def news_sentiment_cmd(interaction: discord.Interaction, symbol: str):
 
     await interaction.followup.send(embed=e)
 
-# ---- SIGNAL HISTORY ----
 @client.tree.command(name="signal_history", description="Show last 3 signals we posted for this ticker")
 @app_commands.describe(symbol="Ticker symbol, e.g., AAPL")
 async def signal_history_cmd(interaction: discord.Interaction, symbol: str):
@@ -485,11 +512,9 @@ async def signal_history_cmd(interaction: discord.Interaction, symbol: str):
     )
     await interaction.response.send_message(embed=e, ephemeral=True)
 
-# ---- run ----
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN env var to your Bot Token.")
-    # Optional: print to confirm guild targeting
     if GUILD_ID:
         print(f"🔧 GUILD_ID set: {GUILD_ID} (commands sync instantly to that server)")
     history.init_db()
