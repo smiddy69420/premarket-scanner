@@ -1,7 +1,8 @@
 # scanner.py
 from __future__ import annotations
 import datetime as dt
-from typing import List, Tuple, Optional
+import time
+from typing import List, Tuple, Optional, Iterable
 
 import numpy as np
 import pandas as pd
@@ -12,8 +13,12 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 _analyzer = SentimentIntensityAnalyzer()
 
+# 10-minute in-process cache for earnings lookups (ticker -> (date, ts))
+_EARN_CACHE: dict[str, tuple[Optional[dt.date], float]] = {}
+_EARN_TTL = 600.0
 
-def _get_hist(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+
+def _get_hist(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
     t = yf.Ticker(ticker)
     hist = t.history(period=period, interval=interval, auto_adjust=True)
     if hist is None or hist.empty:
@@ -97,38 +102,126 @@ def _bias(last: float, ema20: Optional[float], ema50: Optional[float],
         return "NEUTRAL"
 
 
+def _to_dates(cands: Iterable) -> list[dt.date]:
+    out: list[dt.date] = []
+    for v in cands:
+        if isinstance(v, (pd.Timestamp, dt.datetime, np.datetime64)):
+            try:
+                out.append(pd.to_datetime(v).date())
+            except Exception:
+                pass
+        elif isinstance(v, (int, float)) and v > 0:
+            # epoch seconds or ms
+            try:
+                if v > 10_000_000_000:  # ms
+                    out.append(dt.datetime.utcfromtimestamp(v / 1000).date())
+                else:
+                    out.append(dt.datetime.utcfromtimestamp(v).date())
+            except Exception:
+                pass
+        elif isinstance(v, str) and v.strip():
+            try:
+                out.append(pd.to_datetime(v).date())
+            except Exception:
+                pass
+    return out
+
+
+def _pick_best_date(dates: list[dt.date], today: dt.date) -> Optional[dt.date]:
+    if not dates:
+        return None
+    fut = [d for d in dates if d >= today]
+    if fut:
+        return min(fut)  # earliest upcoming
+    return max(dates)   # most recent past
+
+
 def _earnings_date_for(ticker: str) -> Optional[dt.date]:
+    # cache
+    now = time.time()
+    if ticker in _EARN_CACHE:
+        d, ts = _EARN_CACHE[ticker]
+        if now - ts < _EARN_TTL:
+            return d
+
     t = yf.Ticker(ticker)
     today = dt.date.today()
+    picked: Optional[dt.date] = None
 
-    # 1) get_earnings_dates (preferred)
+    # 1) get_earnings_dates
     try:
-        df = t.get_earnings_dates(limit=12)
+        df = t.get_earnings_dates(limit=16)
         if df is not None and not df.empty:
-            dates = [idx.date() for idx in df.index if isinstance(idx, pd.Timestamp)]
-            if dates:
-                dates.sort(key=lambda d: abs(d - today))
-                return dates[0]
+            idx_dates = _to_dates(list(df.index))
+            cand = _pick_best_date(idx_dates, today)
+            if cand:
+                picked = cand
     except Exception:
         pass
 
-    # 2) calendar (fallback)
-    try:
-        cal = t.calendar
-        if isinstance(cal, pd.DataFrame) and not cal.empty and "Earnings Date" in cal.index:
-            vals = cal.loc["Earnings Date"].dropna().values
-            for v in vals:
-                if isinstance(v, (pd.Timestamp, dt.datetime)):
-                    return v.date()
-                if isinstance(v, str):
+    # 2) calendar dataframe (index or columns)
+    if not picked:
+        try:
+            cal = t.calendar
+            if isinstance(cal, pd.DataFrame) and not cal.empty:
+                cands = []
+                if "Earnings Date" in cal.index:
+                    cands += list(cal.loc["Earnings Date"].dropna().values)
+                if "Earnings Date" in cal.columns:
+                    cands += list(cal["Earnings Date"].dropna().values)
+                if not cands:
+                    cands = list(cal.values.ravel())
+                dates = _to_dates(cands)
+                cand = _pick_best_date(dates, today)
+                if cand:
+                    picked = cand
+        except Exception:
+            pass
+
+    # 3) get_info()['calendarEvents']['earnings']['earningsDate'] (2-element range)
+    if not picked:
+        try:
+            info = t.get_info() or {}
+            ce = info.get("calendarEvents") or {}
+            earn = (ce.get("earnings") or {}).get("earningsDate") or []
+            dates = _to_dates(earn if isinstance(earn, (list, tuple)) else [earn])
+            cand = _pick_best_date(dates, today)
+            if cand:
+                picked = cand
+        except Exception:
+            pass
+
+    # 4) info/fast_info epoch timestamp fields
+    if not picked:
+        try:
+            info = t.get_info() or {}
+            dates = _to_dates([
+                info.get("earningsTimestamp"),
+                info.get("earningsTimestampStart"),
+                info.get("earningsTimestampEnd"),
+                info.get("nextEarningsDate"),
+                info.get("next_earnings_date"),
+            ])
+            # fast_info can be mapping-like or object
+            fi = getattr(t, "fast_info", None)
+            if fi is not None:
+                for k in ("earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd", "nextEarningsDate", "next_earnings_date"):
                     try:
-                        return pd.to_datetime(v).date()
+                        v = getattr(fi, k)
+                        dates += _to_dates([v])
                     except Exception:
-                        continue
-    except Exception:
-        pass
+                        try:
+                            dates += _to_dates([fi.get(k)])
+                        except Exception:
+                            pass
+            cand = _pick_best_date(dates, today)
+            if cand:
+                picked = cand
+        except Exception:
+            pass
 
-    return None
+    _EARN_CACHE[ticker] = (picked, now)
+    return picked
 
 
 def analyze_one_ticker(ticker: str) -> dict:
@@ -178,7 +271,8 @@ def earnings_within_window(tickers: List[str], days: int = 7) -> List[Tuple[str,
     out: List[Tuple[str, dt.date]] = []
     window = dt.timedelta(days=days)
     today = dt.date.today()
-    for tk in set([t.upper() for t in tickers if t and t.strip()]):
+    uniq = {t.strip().upper() for t in tickers if t and t.strip()}
+    for tk in sorted(uniq):
         try:
             d = _earnings_date_for(tk)
             if d and abs(d - today) <= window:
