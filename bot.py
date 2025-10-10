@@ -6,11 +6,15 @@ import asyncio
 import pathlib
 import argparse
 import urllib.request
+import datetime as dt
+
 import discord
 from discord import app_commands
 from discord.ext import commands
-import yfinance as yf
-import datetime as dt
+
+# === Third-party data layer ===
+# We will call into your scanner.py (robust, cached) for all heavy lifting.
+import scanner as sc
 
 # ============================================================
 #  ENVIRONMENT & LOGGING BOOTSTRAP
@@ -21,109 +25,108 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 KEEP_ALIVE = os.getenv("KEEP_ALIVE", "false").lower() == "true"
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
-DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
-SCAN_UNIVERSE = os.getenv("SCAN_UNIVERSE", "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM").split(",")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional, speeds up command sync to one guild
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # used by cron/rest poster
+
+# Optional universe used only for slash autocomplete in a future wave; scanner.py builds its own universe.
+SCAN_UNIVERSE = [s.strip().upper() for s in os.getenv(
+    "SCAN_UNIVERSE", "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"
+).split(",") if s.strip()]
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
+
+pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
 numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
 logging.basicConfig(
     level=numeric_level,
     format="[%(asctime)s] [%(levelname)8s] %(name)s: %(message)s",
 )
-log_boot = logging.getLogger("bootstrap")
-
-pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-log_boot.info(f"CACHE_DIR={CACHE_DIR} | LOG_LEVEL={LOG_LEVEL} | KEEP_ALIVE={KEEP_ALIVE}")
-
-async def _heartbeat_task():
-    log = logging.getLogger("heartbeat")
-    while True:
-        await asyncio.sleep(60)
-        log.debug("tick")
+log = logging.getLogger("bot")
+log.info(f"CACHE_DIR={CACHE_DIR} | LOG_LEVEL={LOG_LEVEL} | KEEP_ALIVE={KEEP_ALIVE}")
 
 # ============================================================
 #  DISCORD SETUP
 # ============================================================
 
 intents = discord.Intents.default()
+# Slash commands don’t need message_content, but leaving True is fine when privileged intent is enabled.
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 
+async def _heartbeat_task():
+    hb = logging.getLogger("heartbeat")
+    while True:
+        await asyncio.sleep(60)
+        hb.debug("tick")
+
+
+async def _refresh_caches_loop():
+    """
+    Background task: refresh the full earnings cache twice a day.
+    Runs in a thread so it never blocks the event loop.
+    """
+    rlog = logging.getLogger("refresh")
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            rlog.info("Refreshing earnings cache…")
+            # Run the heavy job off the event loop
+            await asyncio.to_thread(sc.refresh_all_caches)
+            rlog.info("Earnings cache refresh completed.")
+        except Exception as e:
+            rlog.exception("Cache refresh failed: %s", e)
+        # Sleep ~12 hours
+        await asyncio.sleep(12 * 3600)
+
+
 @bot.event
 async def on_ready():
+    # Fast, reliable guild sync (avoids CommandNotFound during global propagation)
     if DISCORD_GUILD_ID:
         guild = discord.Object(id=int(DISCORD_GUILD_ID))
         await tree.sync(guild=guild)
-        logging.info(f"Slash commands synced to guild {DISCORD_GUILD_ID}")
+        log.info(f"Slash commands synced to guild {DISCORD_GUILD_ID}")
     else:
         await tree.sync()
-        logging.info("Slash commands synced globally")
+        log.info("Slash commands synced globally")
 
     if KEEP_ALIVE:
         asyncio.create_task(_heartbeat_task())
 
-    logging.info(f"Logged in as {bot.user} (id={bot.user.id})")
+    # Start background cache refresh loop
+    asyncio.create_task(_refresh_caches_loop())
+
+    log.info(f"Logged in as {bot.user} (id={bot.user.id})")
 
 # ============================================================
-#  SCANNER FUNCTIONS
+#  SAFE HELPERS
 # ============================================================
 
-def analyze_ticker(symbol: str):
-    """Basic analysis block using yfinance"""
+async def _safe_followup(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
+    """
+    Always send *something* so we never trip the 'application did not respond' banner.
+    """
     try:
-        data = yf.download(symbol, period="3mo", interval="1d", progress=False)
-        if data.empty:
-            raise ValueError("No price data returned")
-
-        close = data["Close"].iloc[-1]
-        ema20 = data["Close"].ewm(span=20).mean().iloc[-1]
-        ema50 = data["Close"].ewm(span=50).mean().iloc[-1]
-        macd = (data["Close"].ewm(span=12).mean() - data["Close"].ewm(span=26).mean()).iloc[-1]
-        rsi = 100 - (100 / (1 + (data["Close"].diff().clip(lower=0).rolling(14).mean() /
-                                 abs(data["Close"].diff().clip(upper=0)).rolling(14).mean()).iloc[-1]))
-
-        decision = "CALL" if close > ema20 > ema50 else "PUT" if close < ema20 < ema50 else "NEUTRAL"
-        return {
-            "symbol": symbol,
-            "close": round(close, 2),
-            "ema20": round(ema20, 2),
-            "ema50": round(ema50, 2),
-            "macd": round(macd, 3),
-            "rsi": round(rsi, 1),
-            "decision": decision,
-        }
-    except Exception as e:
-        logging.exception(f"Analyze error for {symbol}: {e}")
-        return None
+        if embed is not None:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(content or "Done.", ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        log.exception("Followup send failed: %s", e)
 
 
-def get_earnings(symbol: str):
-    """Return next and previous earnings from yfinance"""
-    try:
-        tk = yf.Ticker(symbol)
-        cal = tk.earnings_dates
-        if cal is None or cal.empty:
-            return None
-        today = dt.datetime.utcnow().date()
-        # Flatten index for ease
-        cal = cal.reset_index()
-        cal["Earnings Date"] = cal["Earnings Date"].dt.date
-        nearest = cal.iloc[(cal["Earnings Date"] - today).abs().argsort()[:1]]
-        date = nearest["Earnings Date"].values[0]
-        eps = nearest["EPS Estimate"].values[0] if "EPS Estimate" in nearest else None
-        return {"symbol": symbol, "date": str(date), "eps": eps}
-    except Exception as e:
-        logging.exception(f"Earnings fetch failed for {symbol}: {e}")
-        return None
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
 
 # ============================================================
-#  DISCORD COMMANDS
+#  SLASH COMMANDS (using scanner.py)
 # ============================================================
 
 @tree.command(name="ping", description="Check bot responsiveness")
@@ -131,45 +134,57 @@ async def ping_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("📍 Pong", ephemeral=True)
 
 
-@tree.command(name="scan_ticker", description="Analyze one ticker (e.g. NVDA, TSLA)")
-@app_commands.describe(symbol="Ticker symbol to analyze (e.g. NVDA)")
+@tree.command(name="scan_ticker", description="Analyze a single ticker with TA & options snapshot")
+@app_commands.describe(symbol="Ticker symbol (e.g., NVDA)")
 async def scan_ticker(interaction: discord.Interaction, symbol: str):
+    # Defer quickly so Discord knows we're working
     await interaction.response.defer(thinking=True)
-    data = analyze_ticker(symbol.upper())
-    if not data:
-        await interaction.followup.send(f"❌ Could not analyze {symbol.upper()}", ephemeral=True)
-        return
-    msg = (
-        f"**{data['symbol']} • {data['decision']}**\n"
-        f"Last: ${data['close']}\nEMA20: {data['ema20']} | EMA50: {data['ema50']}\n"
-        f"MACD: {data['macd']} | RSI: {data['rsi']}"
-    )
-    await interaction.followup.send(msg)
+
+    sym = symbol.strip().upper()
+    try:
+        # Run analysis in a thread (yfinance is I/O + CPU); never block the event loop
+        card = await asyncio.to_thread(sc.analyze_one_ticker, sym)
+        if card is None:
+            await _safe_followup(interaction, f"❌ Could not analyze **{sym}** (no price data).", ephemeral=True)
+            return
+
+        embed = sc.render_ticker_embed(card)
+        await _safe_followup(interaction, embed=embed)
+    except Exception as e:
+        log.exception("scan_ticker failed for %s: %s", sym, e)
+        await _safe_followup(interaction, f"❌ Error analyzing **{sym}**.", ephemeral=True)
 
 
-@tree.command(name="earnings_watch", description="Show all companies with earnings within ±N days")
+@tree.command(name="earnings_watch", description="List tickers with earnings within ±N days (1–30)")
 @app_commands.describe(days="Number of days to search ahead/back (1–30)")
 async def earnings_watch(interaction: discord.Interaction, days: int = 7):
-    if days < 1 or days > 30:
-        await interaction.response.send_message("Please pick between 1–30 days.", ephemeral=True)
+    if not (1 <= days <= 30):
+        await interaction.response.send_message("Please choose a number between 1 and 30.", ephemeral=True)
         return
+
     await interaction.response.defer(thinking=True)
-    today = dt.datetime.utcnow().date()
-    results = []
-    for sym in SCAN_UNIVERSE:
-        e = get_earnings(sym.strip())
-        if e:
-            edate = dt.datetime.strptime(e["date"], "%Y-%m-%d").date()
-            delta = (edate - today).days
-            if abs(delta) <= days:
-                results.append(f"**{sym}** → {e['date']} ({delta:+} days)")
-    if not results:
-        await interaction.followup.send(f"No earnings within ±{days} days.", ephemeral=True)
-    else:
-        await interaction.followup.send("\n".join(results))
+
+    try:
+        # Use your cached, robust universe scanner
+        rows = await asyncio.to_thread(sc.earnings_universe_window, days)
+        if not rows:
+            await _safe_followup(interaction, f"No earnings within ±{days} days.")
+            return
+
+        # Paginate in embeds (Discord limits)
+        PAGE = 25
+        total_pages = (len(rows) + PAGE - 1) // PAGE
+        page_no = 1
+        for chunk in _chunk(rows, PAGE):
+            embed = sc.render_earnings_page_embed(chunk, days, page_no, total_pages)
+            await interaction.followup.send(embed=embed)
+            page_no += 1
+    except Exception as e:
+        log.exception("earnings_watch failed: %s", e)
+        await _safe_followup(interaction, f"❌ Error while scanning earnings window ±{days} days.", ephemeral=True)
 
 # ============================================================
-#  REST POSTER + CRON SUPPORT
+#  CRON/REST SUPPORT (unchanged from your version, kept for wave-2)
 # ============================================================
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -183,12 +198,10 @@ def _post_message_rest(channel_id: str, content: str) -> None:
     with urllib.request.urlopen(req, timeout=30) as resp:
         _ = resp.read()
 
-
 def _cron_morning_digest() -> None:
-    """One-shot digest (future: add top-N scans or 30d earnings summary)."""
     try:
         utc_now = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
-        msg = f"🤖 Cron heartbeat OK • {utc_now}\nNext upgrade → full top-10 scan & 30d earnings digest."
+        msg = f"🤖 Cron heartbeat OK • {utc_now}\nNext upgrade → top-10 scan & 30-day earnings digest."
         _post_message_rest(DISCORD_CHANNEL_ID, msg)
     except Exception as e:
         logging.getLogger("cron").exception("Cron failed: %s", e)
@@ -200,15 +213,17 @@ def _cron_morning_digest() -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Premarket Scanner bot")
-    parser.add_argument("--mode", choices=["bot", "cron"], default="bot",
-                        help="Run live Discord bot (gateway) or one-shot cron poster.")
+    parser.add_argument(
+        "--mode", choices=["bot", "cron"], default="bot",
+        help="Run Discord gateway (bot) or one-shot cron poster."
+    )
     args = parser.parse_args()
 
     if args.mode == "cron":
-        logging.info("Running in CRON mode (no gateway).")
+        log.info("Running in CRON mode (no gateway).")
         if not DISCORD_CHANNEL_ID:
             raise RuntimeError("CRON mode requires DISCORD_CHANNEL_ID.")
         _cron_morning_digest()
     else:
-        logging.info("Running in BOT mode (gateway).")
+        log.info("Running in BOT mode (gateway).")
         bot.run(DISCORD_BOT_TOKEN)
