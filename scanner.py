@@ -1,261 +1,272 @@
-# scanner.py — v4.3 Final with liquidity + expiration logic + cleaner reasons
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
+# scanner.py
+import math
 import datetime as dt
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
 import pytz
 import requests
+import yfinance as yf
 
-# Discord webhook (optional if posting from GitHub workflow)
-WEBHOOK = None  # or set manually: "https://discord.com/api/webhooks/..."
-
-# ==============================
-# CONFIGURATION
-# ==============================
-UNIVERSE = [
-    "SPY","QQQ","AAPL","MSFT","GOOGL","AMZN","META","NVDA","TSLA",
-    "NFLX","ORCL","CRM","ADBE","COST","WMT","BA","PEP","KO","INTC",
-    "SHOP","AMD","PYPL","V","MA","JPM","UNH","XOM","CVX","HD","CAT",
-    "ABBV","LLY","GS","NKE","PLTR","SMCI","MRNA","T","VZ","DIS"
-]
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
 
 NY = pytz.timezone("America/New_York")
-TARGET_EXP_MIN_DAYS = 5
-TARGET_EXP_MAX_DAYS = 14
 
-MIN_PRICE = 5
-MIN_AVG_VOL = 2e6
-MAX_SPREAD_PCT = 8.0
-OPT_VOL_MIN = 300
-OPT_OI_MIN = 500
-RELAX_SPREAD_PCT = 12.0
-RELAX_VOL_MIN = 100
-RELAX_OI_MIN = 100
+# -------- Helpers
 
+def _now_et() -> dt.datetime:
+    return dt.datetime.now(tz=NY)
 
-# ==============================
-# HELPERS
-# ==============================
-
-def _to_float(x):
-    try:
-        return float(x.item() if hasattr(x, "item") else x)
-    except:
-        return float(x)
-
-def now_et():
-    return dt.datetime.now(NY)
-
-def daily_liquidity_ok(tkr):
-    try:
-        d = yf.download(tkr, period="60d", interval="1d", progress=False)
-        if d.empty: return False
-        px = _to_float(d["Close"].iloc[-1])
-        avgv = _to_float(d["Volume"].tail(20).mean())
-        return px >= MIN_PRICE and avgv >= MIN_AVG_VOL
-    except:
-        return False
-
-def add_indicators(df):
-    close = df["Close"]
-    vol = df["Volume"]
-    df["EMA20"] = EMAIndicator(close, 20).ema_indicator()
-    df["EMA50"] = EMAIndicator(close, 50).ema_indicator()
-    macd = MACD(close, 26, 12, 9)
-    df["MACD_H"] = macd.macd_diff()
-    df["RSI"] = RSIIndicator(close, 14).rsi()
-    df["VOL20"] = vol.rolling(20).mean()
-    df["ATRp"] = (df["High"] - df["Low"]).rolling(14).mean() / close.rolling(14).mean() * 100
+def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure single-level columns."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join([str(c) for c in col if c != '']).strip('_') for col in df.columns.values]
     return df
 
-def news_score(tkr, n=10):
-    try:
-        news = yf.Ticker(tkr).news or []
-        titles = [x.get("title","").lower() for x in news[:n]]
-        pos = {"surge","beat","beats","strong","upgrade","record","growth","bull","rally","up"}
-        neg = {"miss","misses","downgrade","weak","lawsuit","probe","fall","drop","down","cuts","cut"}
-        score = sum(any(w in t for w in pos) for t in titles) - sum(any(w in t for w in neg) for t in titles)
-        return score, (titles[0] if titles else "")
-    except:
-        return 0, ""
+def fetch_bars(symbol: str, period="5d", interval="5m") -> pd.DataFrame:
+    d = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+    if d is None or d.empty:
+        raise ValueError(f"No data for {symbol}")
+    d = _flatten_cols(d)
+    # Standardize column names to: Open, High, Low, Close, Volume
+    for c in ["Open","High","Low","Close","Volume"]:
+        if c not in d.columns:
+            # try alternative names like "Open_adjclose"
+            match = [x for x in d.columns if x.lower().startswith(c.lower())]
+            if match:
+                d[c] = d[match[0]]
+            else:
+                raise ValueError(f"Missing column {c} for {symbol}")
+    d = d.dropna(subset=["Open","High","Low","Close"])
+    return d
 
-def score_row(r, nscore):
-    trend = (2 if r["Close"] > r["EMA20"] > r["EMA50"] else -2 if r["Close"] < r["EMA20"] < r["EMA50"] else 0)
-    momentum = 1 if r["MACD_H"] > 0 else -1
-    rsi_adj = (r["RSI"] - 50) / 10
-    vol_boost = 1.5 if r["Volume"] > 1.5 * r["VOL20"] else 0
-    nsc = max(-2, min(2, nscore))
-    return (trend * 2) + (momentum * 1.5) + rsi_adj + vol_boost + nsc
+@dataclass
+class TAResult:
+    symbol: str
+    price: float
+    bias: str            # CALL / PUT / NEUTRAL
+    buy_low: float
+    buy_high: float
+    target: float
+    stop: float
+    reasons: str
+    risk: str
+    score: float
+    rsi: float
+    macd_diff: float
 
-def bias_from_score(s): return "CALL" if s >= 0 else "PUT"
+@dataclass
+class OptionPick:
+    contract: Optional[str]
+    exp: Optional[str]
+    strike: Optional[float]
+    mid: Optional[float]
+    spread_pct: Optional[float]
+    vol: Optional[int]
+    oi: Optional[int]
+    note: Optional[str]
 
-def levels_from_atr(price, atrp, bias):
-    er = price * (atrp / 100) * 0.35
-    tg = price * (atrp / 100) * 1.10
-    st = price * (atrp / 100) * 0.70
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["Close"].astype(float)
+    ema20 = EMAIndicator(close, window=20).ema_indicator()
+    ema50 = EMAIndicator(close, window=50).ema_indicator()
+    macd = MACD(close)
+    rsi = RSIIndicator(close, window=14).rsi()
+    atr = AverageTrueRange(high=df["High"], low=df["Low"], close=close, window=14).average_true_range()
+    out = df.copy()
+    out["EMA20"], out["EMA50"] = ema20, ema50
+    out["MACD"], out["MACD_SIG"] = macd.macd(), macd.macd_signal()
+    out["MACD_DIFF"] = out["MACD"] - out["MACD_SIG"]
+    out["RSI"] = rsi
+    out["ATR"] = atr
+    return out.dropna().copy()
+
+def _risk_from_spread_vol(spread_pct: float, oi: int) -> str:
+    if spread_pct is None or oi is None:
+        return "High"
+    if spread_pct <= 0.05 and oi >= 1000: return "Low"
+    if spread_pct <= 0.10 and oi >= 300: return "Medium"
+    return "High"
+
+def analyze_symbol(symbol: str, period="5d", interval="5m") -> Tuple[TAResult, OptionPick]:
+    df = fetch_bars(symbol, period=period, interval=interval)
+    df = compute_indicators(df)
+    last = df.iloc[-1]
+    px = float(last["Close"])
+    ema20, ema50 = float(last["EMA20"]), float(last["EMA50"])
+    macd_diff = float(last["MACD_DIFF"])
+    rsi = float(last["RSI"])
+    atr = float(last["ATR"])
+    # bias
+    bias = "NEUTRAL"
+    if px > ema20 > ema50 and macd_diff > 0 and rsi >= 55:
+        bias = "CALL"
+    elif px < ema20 < ema50 and macd_diff < 0 and rsi <= 45:
+        bias = "PUT"
+
+    # simple plan using ATR
+    buy_pad = 0.15 * atr if atr > 0 else max(0.001*px, 0.02)
+    tgt_pad = 0.35 * atr if atr > 0 else max(0.002*px, 0.05)
+    stp_pad = 0.25 * atr if atr > 0 else max(0.002*px, 0.05)
+
     if bias == "CALL":
-        return (round(price - er, 2), round(price + er, 2)), round(price + tg, 2), round(price - st, 2)
+        buy_low, buy_high = px - buy_pad, px - 0.5*buy_pad
+        target, stop = px + tgt_pad, px - stp_pad
+    elif bias == "PUT":
+        buy_low, buy_high = px + 0.5*buy_pad, px + buy_pad
+        target, stop = px - tgt_pad, px + stp_pad
     else:
-        return (round(price - er, 2), round(price + er, 2)), round(price - tg, 2), round(price + st, 2)
+        buy_low, buy_high = px - 0.25*buy_pad, px + 0.25*buy_pad
+        target, stop = px + tgt_pad, px - stp_pad
 
-def nearest_exp(tkr):
+    reasons = []
+    if bias != "NEUTRAL":
+        reasons.append(f"Trend: {('Up' if bias=='CALL' else 'Down')} (Close {px:.2f} vs EMA20/EMA50)")
+    else:
+        reasons.append(f"Trend: Mixed (Close {px:.2f} vs EMA20/EMA50)")
+    reasons.append(f"MACD diff: {macd_diff:+.3f}")
+    reasons.append(f"RSI: {rsi:.1f}")
+
+    score = (1 if bias == "CALL" else -1 if bias == "PUT" else 0) * 6 \
+            + (rsi - 50) / 5.0 + (macd_diff * 10)
+
+    ta = TAResult(
+        symbol=symbol.upper(),
+        price=px,
+        bias=bias,
+        buy_low=float(buy_low),
+        buy_high=float(buy_high),
+        target=float(target),
+        stop=float(stop),
+        reasons="; ".join(reasons),
+        risk="Medium",
+        score=float(score),
+        rsi=rsi,
+        macd_diff=macd_diff
+    )
+
+    opt = choose_option(symbol, px, bias)
+    # refine risk with option liquidity if we have it
+    if opt and opt.spread_pct is not None and opt.oi is not None:
+        ta.risk = _risk_from_spread_vol(opt.spread_pct, opt.oi)
+
+    return ta, opt
+
+def _pick_exp(exp_list: List[str], days_min=7, days_max=21) -> Optional[str]:
+    if not exp_list: return None
+    today = _now_et().date()
+    def dte(exp):
+        try: return (dt.datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+        except: return 9999
+    exp_sorted = sorted(exp_list, key=lambda x: abs(max(min(dte(x), days_max), days_min) - dte(x)))
+    # prefer within band, else earliest future
+    for e in exp_sorted:
+        if 0 < dte(e) <= 45:  # cap
+            if days_min <= dte(e) <= days_max:
+                return e
+    # fallback: next available future
+    fut = [e for e in exp_sorted if dte(e) > 0]
+    return fut[0] if fut else exp_sorted[0]
+
+def _nearest(series: pd.Series, value: float) -> float:
+    return float(series.iloc[(series - value).abs().argsort().iloc[0]])
+
+def choose_option(symbol: str, last_px: float, bias: str) -> OptionPick:
     try:
-        exps = yf.Ticker(tkr).options
-        if not exps: return None
-        today = dt.date.today()
-        to_date = lambda s: dt.date(*map(int, s.split("-")))
-        c = [((to_date(e) - today).days, e) for e in exps if to_date(e) >= today]
-        c_in = [(d, e) for d, e in c if TARGET_EXP_MIN_DAYS <= d <= TARGET_EXP_MAX_DAYS]
-        if c_in: return sorted(c_in)[0][1]
-        return sorted(c)[0][1]
-    except:
-        return None
+        tkr = yf.Ticker(symbol)
+        exps = list(tkr.options)
+        if not exps:
+            return OptionPick(None,None,None,None,None,None,None,"No options listed")
+        exp = _pick_exp(exps, 7, 21) or exps[0]
+        oc = tkr.option_chain(exp)
+        side = oc.calls if bias == "CALL" else oc.puts if bias == "PUT" else oc.calls
+        df = side.copy()
+        if df is None or df.empty:
+            return OptionPick(None, exp, None, None, None, None, None, "Empty option chain")
+        # Ensure needed fields exist
+        for col in ["bid","ask","strike","volume","openInterest","contractSymbol"]:
+            if col not in df.columns: df[col] = np.nan
+        df["mid"] = (df["bid"].fillna(0) + df["ask"].fillna(0)) / 2.0
+        df["spread_pct"] = np.where(df["mid"] > 0, (df["ask"].fillna(0) - df["bid"].fillna(0)) / df["mid"], np.inf)
 
-def pick_option_contract(tkr, bias, price):
-    try:
-        exp = nearest_exp(tkr)
-        if not exp: return None
-        ch = yf.Ticker(tkr).option_chain(exp)
-        tbl = ch.puts if bias == "PUT" else ch.calls
-        if tbl.empty: return None
-        t = tbl.copy()
-        t["mid"] = (t["bid"] + t["ask"]) / 2
-        t = t[(t["mid"] > 0) & (t["ask"] >= t["bid"])]
-        t["dist"] = abs(t["strike"] - price)
-        t["spread_pct"] = (t["ask"] - t["bid"]) / t["mid"] * 100
-        strict = t[(t["volume"] >= OPT_VOL_MIN) & (t["openInterest"] >= OPT_OI_MIN) & (t["spread_pct"] <= MAX_SPREAD_PCT)]
-        relaxed = t[(t["volume"] >= RELAX_VOL_MIN) & (t["openInterest"] >= RELAX_OI_MIN) & (t["spread_pct"] <= RELAX_SPREAD_PCT)]
-        use = strict if not strict.empty else relaxed
-        if use.empty: return {"expiration": exp, "note": "No liquid ATM contract"}
-        row = use.sort_values(["dist", "spread_pct"]).iloc[0]
-        return {
-            "expiration": exp,
-            "contract": str(row.get("contractSymbol", "")),
-            "strike": float(row["strike"]),
-            "mid": round(float(row["mid"]), 2),
-            "spread_pct": round(float(row["spread_pct"]), 1),
-            "vol": int(row["volume"]),
-            "oi": int(row["openInterest"])
-        }
-    except:
-        return None
+        # pick nearest ATM with liquidity/spread filters
+        df["dist"] = (df["strike"] - last_px).abs()
+        filtered = df[(df["openInterest"].fillna(0) >= 50) & (df["spread_pct"] <= 0.20)]
+        pick = None
+        if not filtered.empty:
+            pick = filtered.sort_values(by=["dist","spread_pct","openInterest"], ascending=[True, True, False]).iloc[0]
+        else:
+            pick = df.sort_values(by=["dist","spread_pct","openInterest"], ascending=[True, True, False]).iloc[0]
+        return OptionPick(
+            contract=str(pick.get("contractSymbol", "")),
+            exp=exp,
+            strike=float(pick.get("strike", np.nan)),
+            mid=float(pick.get("mid", np.nan)) if np.isfinite(pick.get("mid", np.nan)) else None,
+            spread_pct=float(pick.get("spread_pct", np.nan)) if np.isfinite(pick.get("spread_pct", np.nan)) else None,
+            vol=int(pick.get("volume", 0)) if not pd.isna(pick.get("volume", np.nan)) else 0,
+            oi=int(pick.get("openInterest", 0)) if not pd.isna(pick.get("openInterest", np.nan)) else 0,
+            note=None
+        )
+    except Exception as e:
+        return OptionPick(None, None, None, None, None, None, None, f"Option error: {e}")
 
-
-# ==============================
-# MAIN SCAN FUNCTION
-# ==============================
-
-def run_scan(top_k=10):
-    all_data = yf.download(" ".join(UNIVERSE), period="5d", interval="5m", group_by="ticker", progress=False)
-    results = []
-    for tkr in UNIVERSE:
+def scan_many(tickers: List[str], limit: int = 10, period="5d", interval="5m") -> List[Dict]:
+    rows = []
+    for sym in tickers:
         try:
-            df = all_data[tkr]
-            if df.empty: continue
-            df = add_indicators(df).dropna()
-            if df.empty or not daily_liquidity_ok(tkr): continue
-            last = df.iloc[-1]
-            price = _to_float(last["Close"])
-            atrp = _to_float(last["ATRp"])
-            nscore, ex = news_score(tkr)
-            total = score_row(last, nscore)
-            bias = bias_from_score(total)
-            entry, target, stop = levels_from_atr(price, atrp, bias)
-
-            reasons = []
-            if last["Close"] > last["EMA20"] > last["EMA50"]:
-                reasons.append("Uptrend (Close>EMA20>EMA50)")
-            elif last["Close"] < last["EMA20"] < last["EMA50"]:
-                reasons.append("Downtrend (Close<EMA20<EMA50)")
-            else:
-                reasons.append("Mixed trend")
-
-            reasons.append("MACD momentum up" if last["MACD_H"] > 0 else "MACD momentum down")
-            reasons.append(f"RSI {float(last['RSI']):.1f}")
-
-            if last["Volume"] > 2 * last["VOL20"]:
-                reasons.append("Unusual volume")
-            elif last["Volume"] > 1.5 * last["VOL20"]:
-                reasons.append("Volume > 1.5× avg")
-            else:
-                reasons.append("Moderate volume")
-
-            if atrp > 3:
-                reasons.append(f"High range {atrp:.1f}%")
-
-            reasons.append(
-                "News positive" if nscore > 0 else ("News negative" if nscore < 0 else "News neutral/low-signal")
-            )
-            if ex:
-                reasons.append(f"News ex: {ex[:60]}…")
-
-            opt = pick_option_contract(tkr, bias, price)
-            exp = opt.get("expiration") if opt else None
-            if not exp: continue
-
-            if "contract" not in opt:
-                opt["contract"] = ""
-                opt["note"] = opt.get("note", "no pick")
-
-            results.append({
-                "Ticker": tkr,
-                "Price": round(price, 2),
-                "Score": round(total, 2),
-                "Type": bias,
-                "Target Expiration": exp,
-                "Buy Range": f"${entry[0]}–${entry[1]}",
-                "Sell Target": f"${target}",
-                "Stop Idea": f"${stop}",
-                "Risk": "High" if atrp >= 4 else "Medium",
-                "Option Contract": opt["contract"],
-                "Strike": opt.get("strike", ""),
-                "Opt Mid": opt.get("mid", ""),
-                "Spread %": opt.get("spread_pct", ""),
-                "Opt Vol": opt.get("vol", ""),
-                "Opt OI": opt.get("oi", ""),
-                "Why": "; ".join(reasons),
-                "Opt Note": opt.get("note", ""),
+            ta, opt = analyze_symbol(sym, period=period, interval=interval)
+            rows.append({
+                "symbol": ta.symbol,
+                "price": ta.price,
+                "score": ta.score,
+                "bias": ta.bias,
+                "buy_low": ta.buy_low,
+                "buy_high": ta.buy_high,
+                "target": ta.target,
+                "stop": ta.stop,
+                "risk": ta.risk,
+                "reasons": ta.reasons,
+                "opt": opt
             })
         except Exception as e:
-            print(f"[WARN] {tkr}: {e}")
-            continue
+            rows.append({
+                "symbol": sym.upper(),
+                "error": str(e)
+            })
+    # sort by absolute score (strongest first)
+    ok = [r for r in rows if "score" in r]
+    err = [r for r in rows if "error" in r]
+    ok = sorted(ok, key=lambda r: abs(r["score"]), reverse=True)[:limit]
+    return ok + err
 
-    if not results:
-        print("No valid signals.")
-        return pd.DataFrame(), "No valid signals."
+# -------- Earnings (for any symbol)
 
-    df = pd.DataFrame(results)
-    ranked = df.sort_values("Score", ascending=False).head(top_k)
-    return ranked, f"Used data: period=5d, interval=5m. Top {top_k} ranked candidates."
+def _yahoo_calendar_event(symbol: str) -> Optional[dt.datetime]:
+    try:
+        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
+        hdrs = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=hdrs, timeout=10)
+        j = r.json()
+        arr = j["quoteSummary"]["result"][0]["calendarEvents"]["earnings"]["earningsDate"]
+        raw = arr[0].get("raw")
+        if raw:
+            return dt.datetime.fromtimestamp(raw, tz=NY).replace(hour=0, minute=0, second=0, microsecond=0)
+    except Exception:
+        pass
+    return None
 
-# ==============================
-# DISCORD POSTING (optional)
-# ==============================
-
-def post_to_discord(df, meta):
-    if not WEBHOOK: 
-        print("No Discord webhook set, skipping post.")
-        return
-    msg = f"**📢 Ranked Scan ({len(df)} picks)**\n"
-    for _, r in df.iterrows():
-        msg += (f"- **{r['Ticker']}** @ ${r['Price']} → **{r['Type']}** | "
-                f"Exp: {r['Target Expiration']} | Buy: {r['Buy Range']} | "
-                f"Target: {r['Sell Target']} | Stop: {r['Stop Idea']} | Risk: {r['Risk']}\n"
-                f"   ↳ {r['Option Contract']} (strike {r['Strike']}, mid ~${r['Opt Mid']}, "
-                f"spread ~{r['Spread %']}%, vol {r['Opt Vol']}, OI {r['Opt OI']})\n")
-    requests.post(WEBHOOK, json={"content": msg})
-
-# ==============================
-# MAIN
-# ==============================
-
-if __name__ == "__main__":
-    df, meta = run_scan()
-    print(meta)
-    if not df.empty:
-        print(df)
-        if WEBHOOK:
-            post_to_discord(df, meta)
-
+def earnings_date(symbol: str) -> Optional[dt.datetime]:
+    try:
+        df = yf.Ticker(symbol).get_earnings_dates(limit=8)
+        if df is not None and not df.empty:
+            # take nearest to today
+            dts = [pd.to_datetime(ix).to_pydatetime().astimezone(NY) for ix in df.index]
+            d = min(dts, key=lambda d: abs((d - _now_et()).days))
+            return d.replace(hour=0, minute=0, second=0, microsecond=0)
+    except Exception:
+        pass
+    return _yahoo_calendar_event(symbol)
