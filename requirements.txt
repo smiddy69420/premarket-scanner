@@ -5,4 +5,3 @@ numpy
 ta
 requests
 pytz
-audioop-lts==0.2.1
