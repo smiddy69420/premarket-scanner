@@ -1,305 +1,260 @@
 # bot.py
 import os
-import sys
 import asyncio
+import math
 import datetime as dt
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import List, Tuple, Optional
 
-import logging
 import discord
-from discord import app_commands
+from discord import app_commands, Embed
+from discord.ext import commands
 
-# ---------------- Logging ----------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="[{asctime}] [{levelname:^8}] {name}: {message}",
-    style="{",
-)
-log = logging.getLogger("bot")
+import pandas as pd
+import yfinance as yf
 
-# ---------------- Environment ------------
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
+from utils.universe import UniverseManager
 
-# Single-guild sync for speed; if unset we sync globally
-GUILD_ID = os.getenv("DISCORD_GUILD_ID") or os.getenv("GUILD_ID")
-GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
-
-CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional target channel
-CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/premarket_cache")
-KEEP_ALIVE = os.getenv("KEEP_ALIVE", "true").lower() in ("1", "true", "yes")
-
-# Admin whitelist to run /sync (comma-separated Discord user IDs)
-ADMIN_USER_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()
-}
-
-# Universe sources (in order of preference)
-ALL_TICKERS_ENV = os.getenv("ALL_TICKERS", "")          # giant comma-separated list (optional)
-SCAN_UNIVERSE = os.getenv(
-    "SCAN_UNIVERSE",
-    "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"
-)
-
-SYMBOLS_FILE = os.getenv("SYMBOLS_FILE", "data/symbols_robinhood.txt")  # optional flat file
-
-# ---------------- Discord client ----------
-# Minimal intents but include guilds to silence warnings and keep state sane.
-intents = discord.Intents.none()
+# ---------- intents & bot ----------
+intents = discord.Intents.default()
 intents.guilds = True
+# message_content not required for slash commands
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+UNIVERSE = UniverseManager()
 
-# ---------------- Import scanner ----------
-# We integrate with your local scanner.py but do not assume exact API.
-import importlib
-try:
-    scanner = importlib.import_module("scanner")
-except Exception:
-    log.exception("Failed importing scanner.py")
-    raise
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
+ADMIN_ID_INT = int(ADMIN_USER_ID) if ADMIN_USER_ID and ADMIN_USER_ID.isdigit() else None
 
-# ------------- helpers -------------------
-def _now_utc() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
+# ---------- helpers ----------
+def fmt_money(x: float) -> str:
+    return f"${x:,.2f}"
 
-def _parse_csv_symbols(csv: str) -> List[str]:
-    return [s.strip().upper() for s in csv.split(",") if s.strip()]
+def pct(a: float) -> str:
+    s = f"{a:+.2f}%"
+    return s
 
-def _load_symbols_file(path: str) -> List[str]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            syms = [ln.strip().upper() for ln in f if ln.strip()]
-            return [s for s in syms if s.isascii()]
-    except FileNotFoundError:
-        return []
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-def universe_symbols() -> List[str]:
-    # 1) massive list via env
-    if ALL_TICKERS_ENV.strip():
-        return _parse_csv_symbols(ALL_TICKERS_ENV)
-    # 2) repo file (drop in later for “all Robinhood”)
-    file_syms = _load_symbols_file(SYMBOLS_FILE)
-    if file_syms:
-        return file_syms
-    # 3) fallback to configured small universe
-    return _parse_csv_symbols(SCAN_UNIVERSE)
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.clip(lower=0)).rolling(window=period).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=period).mean()
+    rs = gain / loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
 
-async def _safe_send_followup(
-    interaction: discord.Interaction,
-    embed: Optional[discord.Embed] = None,
-    content: Optional[str] = None,
-    files: Optional[List[discord.File]] = None,
-    ephemeral: bool = False,
-):
-    try:
-        if embed:
-            await interaction.followup.send(content=content or "", embed=embed, files=files, ephemeral=ephemeral)
-        else:
-            await interaction.followup.send(content or "Done.", ephemeral=ephemeral)
-    except Exception:
-        log.exception("Failed followup.send")
+async def download_price_history(symbol: str, period: str = "6mo") -> Optional[pd.DataFrame]:
+    loop = asyncio.get_event_loop()
+    def _job():
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+        return None
+    return await loop.run_in_executor(None, _job)
 
-def _coerce_result(
-    res: Union[discord.Embed, Tuple[discord.Embed, List[discord.File]], None]
-) -> Tuple[Optional[discord.Embed], Optional[List[discord.File]]]:
-    if res is None:
-        return None, None
-    if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], discord.Embed):
-        return res[0], res[1]
-    if isinstance(res, discord.Embed):
-        return res, None
-    return None, None
+async def get_next_earnings_date(symbol: str, limit: int = 12) -> Optional[pd.Timestamp]:
+    loop = asyncio.get_event_loop()
+    def _job():
+        try:
+            t = yf.Ticker(symbol)
+            df = t.get_earnings_dates(limit=limit)
+            if df is None or df.empty:
+                return None
+            # dataframe often has index named "Earnings Date"
+            col = "Earnings Date"
+            if col in df.columns:
+                # sometimes 'Earnings Date' is a column
+                s = pd.to_datetime(df[col])
+                # choose the next future date, else the most recent past
+                now = pd.Timestamp.utcnow().tz_localize(None)
+                future = s[s >= now]
+                return future.min() if not future.empty else s.max()
+            else:
+                # sometimes the index is the date
+                s = pd.to_datetime(df.index)
+                now = pd.Timestamp.utcnow().tz_localize(None)
+                future = s[s >= now]
+                return future.min() if not future.empty else s.max()
+        except Exception:
+            return None
+    return await loop.run_in_executor(None, _job)
 
-# ---------------- Lifecycle ---------------
-@client.event
+def build_scan_embed(symbol: str, df: pd.DataFrame) -> Embed:
+    close = float(df["Close"].iloc[-1])
+    ema20 = float(ema(df["Close"], 20).iloc[-1])
+    ema50 = float(ema(df["Close"], 50).iloc[-1])
+    rsi14 = float(rsi(df["Close"], 14).iloc[-1])
+
+    def perf(days: int) -> float:
+        if len(df) < days + 1:
+            return 0.0
+        return (df["Close"].iloc[-1] / df["Close"].iloc[-(days+1)] - 1) * 100
+
+    p1d = perf(1)
+    p5d = perf(5)
+    p1m = perf(21)  # trading days ~21
+
+    low52 = float(df["Low"].rolling(252, min_periods=1).min().iloc[-1])
+    high52 = float(df["High"].rolling(252, min_periods=1).max().iloc[-1])
+
+    bias = "CALL" if close > ema20 > ema50 else "PUT"
+    why_bits = []
+    if close > ema20: why_bits.append("Close > EMA20")
+    if ema20 > ema50: why_bits.append("EMA20 > EMA50")
+    if close < ema20: why_bits.append("Close < EMA20")
+    if ema20 < ema50: why_bits.append("EMA20 < EMA50")
+    why_bits.append(f"RSI: {rsi14:.1f}")
+
+    e = Embed(title=f"{symbol} • {bias}", color=0x00D084 if bias == "CALL" else 0xE33E3E)
+    e.add_field(name="Last", value=fmt_money(close), inline=True)
+    e.add_field(name="1D / 5D / 1M", value=f"{pct(p1d)} / {pct(p5d)} / {pct(p1m)}", inline=True)
+    e.add_field(name="52W Range", value=f"{fmt_money(low52)} – {fmt_money(high52)}", inline=True)
+    e.add_field(name="EMA20/50", value=f"{ema20:.2f} / {ema50:.2f}", inline=True)
+    e.add_field(name="RSI(14)", value=f"{rsi14:.1f}", inline=True)
+    e.add_field(name="Why", value="; ".join(why_bits), inline=False)
+    e.set_footer(text="Premarket Scanner • multi-signal")
+    return e
+
+# ---------- background: symbols weekly ----------
+async def _refresh_symbols_weekly():
+    """
+    1) ensure we have data/symbols_robinhood.txt on boot.
+    2) keep it fresh weekly without blocking the bot.
+    """
+    loop = asyncio.get_event_loop()
+    # one-time generate if missing
+    await loop.run_in_executor(None, UNIVERSE.ensure_file_exists)
+
+    # do the weekly refresher (blocking loop moved to a worker thread)
+    def _run():
+        UNIVERSE.weekly_refresh_forever()
+    await loop.run_in_executor(None, _run)
+
+# ---------- lifecycle ----------
+@bot.event
 async def on_ready():
-    log.info("CACHE_DIR=%s | LOG_LEVEL=%s | KEEP_ALIVE=%s", CACHE_DIR, LOG_LEVEL, str(KEEP_ALIVE))
-    log.info("Running in BOT mode (gateway).")
+    # sync slash commands globally (or change to guild-only if you prefer)
     try:
-        if GUILD:
-            cmds = await tree.sync(guild=GUILD)
-            log.info("Slash commands synced to guild %s (%d cmds)", GUILD.id, len(cmds))
-        else:
-            cmds = await tree.sync()
-            log.info("Slash commands synced globally (%d cmds)", len(cmds))
-    except Exception:
-        log.exception("Initial slash sync failed")
+        await bot.tree.sync()
+        print("[INFO] Slash commands synced.")
+    except Exception as e:
+        print(f"[WARN] Could not sync commands: {e}")
 
-    if KEEP_ALIVE:
-        async def heartbeat():
-            while True:
-                log.debug("heartbeat: tick")
-                await asyncio.sleep(60)
-        client.loop.create_task(heartbeat())
+    # start the background symbols refresher
+    bot.loop.create_task(_refresh_symbols_weekly())
 
-# ---------------- Commands ----------------
-@tree.command(name="ping", description="Health check.", guild=GUILD)
-async def ping_cmd(interaction: discord.Interaction):
-    await interaction.response.send_message("📍 Pong", ephemeral=True)
+    print(f"[INFO] Logged in as {bot.user} (id={bot.user.id})")
 
-@tree.command(name="sync", description="Force re-sync slash commands (admin).", guild=GUILD)
+# ---------- commands ----------
+@bot.tree.command(name="ping", description="Health check")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("🏓 Pong", ephemeral=True)
+
+# admin-only sync (optional)
+@bot.tree.command(name="sync", description="(Admin) Force resync slash commands")
 async def sync_cmd(interaction: discord.Interaction):
-    # Permission: server owner OR whitelisted admin ID
-    allowed = False
-    try:
-        if interaction.guild and interaction.user:
-            if interaction.user.id == interaction.guild.owner_id:
-                allowed = True
-    except Exception:
-        pass
-    if interaction.user and interaction.user.id in ADMIN_USER_IDS:
-        allowed = True
-
-    if not allowed:
+    if ADMIN_ID_INT is None or interaction.user.id != ADMIN_ID_INT:
         await interaction.response.send_message("Not allowed.", ephemeral=True)
         return
+    await bot.tree.sync()
+    await interaction.response.send_message("✅ Synced.", ephemeral=True)
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        if GUILD:
-            cmds = await tree.sync(guild=GUILD)
-        else:
-            cmds = await tree.sync()
-        names = ", ".join(sorted(c.name for c in cmds))
-        await interaction.followup.send(f"Synced. Commands available: `{names}`")
-        log.info("Manual sync by %s -> %s", interaction.user, names)
-    except Exception:
-        log.exception("Manual sync failed")
-        await interaction.followup.send("Sync failed (see logs).", ephemeral=True)
+@bot.tree.command(name="scan_ticker", description="Scan a single ticker with technicals")
+@app_commands.describe(symbol="Stock symbol like AAPL")
+async def scan_ticker(interaction: discord.Interaction, symbol: str):
+    symbol = symbol.upper().strip()
+    await interaction.response.defer(thinking=True)
+    df = await download_price_history(symbol, period="6mo")
+    if df is None or df.empty:
+        await interaction.followup.send(f"❌ No data for {symbol}")
+        return
+    embed = build_scan_embed(symbol, df)
+    await interaction.followup.send(embed=embed)
 
-@tree.command(name="scan_ticker", description="Run the multi-signal scan for a single ticker.", guild=GUILD)
-@app_commands.describe(symbol="Ticker symbol, e.g. NVDA")
-async def scan_ticker_cmd(interaction: discord.Interaction, symbol: str):
-    sym = symbol.upper().strip()
-    await interaction.response.defer()
-    try:
-        if hasattr(scanner, "analyze_ticker"):
-            fn = scanner.analyze_ticker
-            res = await fn(sym) if asyncio.iscoroutinefunction(fn) else fn(sym)
-            emb, files = _coerce_result(res)
-            if emb:
-                await _safe_send_followup(interaction, embed=emb, files=files)
-                return
-        await _safe_send_followup(interaction, content=f"Scanner missing analyze_ticker() for `{sym}`.", ephemeral=True)
-    except Exception:
-        log.exception("scan_ticker failed for %s", sym)
-        await _safe_send_followup(interaction, content="Sorry, that failed unexpectedly. See logs.", ephemeral=True)
+@bot.tree.command(name="scan", description="Broad scan across the current universe")
+@app_commands.describe(limit="Max number of tickers to scan (to avoid timeouts)")
+async def scan(interaction: discord.Interaction, limit: int = 50):
+    await interaction.response.defer(thinking=True)
 
-@tree.command(name="earnings_watch", description="Show tickers with earnings within ±N days (broad universe supported).", guild=GUILD)
-@app_commands.describe(days="Window in days (±N). Default 30.", limit="Max results to show (default 50).")
-async def earnings_watch_cmd(interaction: discord.Interaction, days: Optional[int] = 30, limit: Optional[int] = 50):
-    days = int(days or 30)
-    limit = max(1, min(int(limit or 50), 200))  # keep messages sane
-    await interaction.response.defer()
+    universe = UNIVERSE.get_universe()
+    symbols = universe[: max(1, min(limit, len(universe)))]
 
-    try:
-        # Preferred fast-path if your scanner exposes a universe helper
-        if hasattr(scanner, "earnings_universe_window"):
-            fn = scanner.earnings_universe_window
-            res = await fn(days) if asyncio.iscoroutinefunction(fn) else fn(days)
-            # accept either list[Embed] or (Embed, files)
-            if isinstance(res, list):
-                if not res:
-                    await _safe_send_followup(interaction, content=f"No earnings within ±{days} days.")
-                    return
-                for emb in res[:limit]:
-                    if isinstance(emb, discord.Embed):
-                        await interaction.followup.send(embed=emb)
-                return
-            emb, files = _coerce_result(res)
-            if emb:
-                await _safe_send_followup(interaction, embed=emb, files=files)
-                return
+    async def scan_one(sym: str) -> Tuple[str, Optional[Embed]]:
+        df = await download_price_history(sym, period="6mo")
+        if df is None or df.empty:
+            return sym, None
+        return sym, build_scan_embed(sym, df)
 
-        # Back-compat slow-path: build the universe and ask scanner per-ticker.
-        syms = universe_symbols()
-        if not syms:
-            await _safe_send_followup(interaction, content="Universe is empty (check SCAN_UNIVERSE / ALL_TICKERS / symbols file).", ephemeral=True)
-            return
+    # small concurrency to keep Yahoo happy
+    sem = asyncio.Semaphore(8)
+    async def bound(sym: str):
+        async with sem:
+            return await scan_one(sym)
 
-        # If single-ticker earnings helper exists, we can parallelize with a small semaphore.
-        results: List[discord.Embed] = []
-        sem = asyncio.Semaphore(10)
+    tasks = [bound(s) for s in symbols]
+    results: List[Tuple[str, Optional[Embed]]] = await asyncio.gather(*tasks)
 
-        async def check(sym: str):
-            try:
-                if hasattr(scanner, "earnings_for_ticker"):
-                    fn = scanner.earnings_for_ticker
-                    info = await fn(sym, days) if asyncio.iscoroutinefunction(fn) else fn(sym, days)
-                    # earnings_for_ticker can return None or an Embed
-                    if isinstance(info, discord.Embed):
-                        results.append(info)
-            except Exception:
-                log.exception("earnings_for_ticker failed for %s", sym)
-
-        async def worker(sym: str):
-            async with sem:
-                await check(sym)
-
-        await asyncio.gather(*(worker(s) for s in syms))
-
-        if not results:
-            await _safe_send_followup(interaction, content=f"No earnings within ±{days} days.")
-            return
-
-        # Post up to 'limit' embeds (Discord rate-limits messages; we keep it reasonable)
-        for emb in results[:limit]:
+    sent = 0
+    for sym, emb in results:
+        if emb:
             await interaction.followup.send(embed=emb)
+            sent += 1
 
-    except Exception:
-        log.exception("Earnings watch failed")
-        await _safe_send_followup(interaction, content="❌ Earnings scan failed (see logs).", ephemeral=True)
+    if sent == 0:
+        await interaction.followup.send("No picks found (or no data).")
 
-@tree.command(name="scan", description="Run a ranked scan for the configured universe (ad-hoc).", guild=GUILD)
-@app_commands.describe(top_n="How many top picks to post (default 5, max 20).")
-async def scan_cmd(interaction: discord.Interaction, top_n: Optional[int] = 5):
-    await interaction.response.defer()
-    syms = universe_symbols()
-    if not syms:
-        await _safe_send_followup(interaction, content="Universe is empty. Set SCAN_UNIVERSE or provide symbols file.", ephemeral=True)
+@bot.tree.command(name="earnings_watch", description="Find tickers with earnings within N days")
+@app_commands.describe(days="Days ahead (default 30)", limit="Max tickers to check")
+async def earnings_watch(interaction: discord.Interaction, days: int = 30, limit: int = 300):
+    await interaction.response.defer(thinking=True)
+
+    universe = UNIVERSE.get_universe()
+    symbols = universe[: max(1, min(limit, len(universe)))]
+    window = pd.Timedelta(days=abs(days))
+    now = pd.Timestamp.utcnow().tz_localize(None)
+
+    async def check(sym: str) -> Optional[Tuple[str, pd.Timestamp]]:
+        d = await get_next_earnings_date(sym, limit=12)
+        if d is None:
+            return None
+        if abs((d - now)) <= window:
+            return (sym, d)
+        return None
+
+    sem = asyncio.Semaphore(8)
+    async def bound(sym: str):
+        async with sem:
+            return await check(sym)
+
+    hits = []
+    for chunk_start in range(0, len(symbols), 50):
+        chunk = symbols[chunk_start:chunk_start+50]
+        parts = await asyncio.gather(*[bound(s) for s in chunk])
+        for item in parts:
+            if item:
+                hits.append(item)
+
+    if not hits:
+        await interaction.followup.send(f"No earnings within ±{days} days.")
         return
 
-    top_n = max(1, min(int(top_n or 5), 20))
-    try:
-        if hasattr(scanner, "rank_universe"):
-            fn = scanner.rank_universe
-            result = await fn(syms, top_n=top_n) if asyncio.iscoroutinefunction(fn) else fn(syms, top_n=top_n)
-            if isinstance(result, list):
-                if not result:
-                    await _safe_send_followup(interaction, content="No picks.")
-                    return
-                for emb in result[:top_n]:
-                    if isinstance(emb, discord.Embed):
-                        await interaction.followup.send(embed=emb)
-                return
-            emb, files = _coerce_result(result)
-            if emb:
-                await _safe_send_followup(interaction, embed=emb, files=files)
-                return
+    # sort by date soonest first
+    hits.sort(key=lambda x: x[1])
+    lines = []
+    for sym, d in hits[:100]:
+        dd = d.strftime("%Y-%m-%d")
+        lines.append(f"• **{sym}** — {dd}")
+    text = "\n".join(lines)
+    e = Embed(title=f"Earnings within ±{days} days", description=text, color=0x2F81F7)
+    e.set_footer(text=f"Universe size scanned: {len(symbols)}  •  Source: Yahoo Finance via yfinance")
+    await interaction.followup.send(embed=e)
 
-        # Fallback: analyze sequentially until we have top_n embeds.
-        posted = 0
-        for sym in syms:
-            if hasattr(scanner, "analyze_ticker"):
-                fn = scanner.analyze_ticker
-                res = await fn(sym) if asyncio.iscoroutinefunction(fn) else fn(sym)
-                emb, files = _coerce_result(res)
-                if emb:
-                    await _safe_send_followup(interaction, embed=emb, files=files)
-                    posted += 1
-                    if posted >= top_n:
-                        break
-        if posted == 0:
-            await _safe_send_followup(interaction, content="No results.", ephemeral=True)
+# ---------- run ----------
+def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit("Missing DISCORD_TOKEN env variable.")
+    bot.run(token)
 
-    except Exception:
-        log.exception("scan failed")
-        await _safe_send_followup(interaction, content="Scan failed (see logs).", ephemeral=True)
-
-# ---------------- Run ---------------------
 if __name__ == "__main__":
-    client.run(TOKEN)
+    main()
