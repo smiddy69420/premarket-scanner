@@ -9,6 +9,44 @@ from discord.ext import tasks
 
 import scanner  # our local module
 
+# --- Environment & logging bootstrap (ONE TIME DROP-IN) ---
+import os, logging, pathlib, asyncio, json, time
+from typing import Optional
+
+# Read env
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/premarket_cache")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "false").lower() == "true"
+
+# Required existing env (you already have these in Render)
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+
+if not DISCORD_BOT_TOKEN:
+    # Keep this explicit so Render errors are obvious
+    raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
+
+# Logging early
+numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
+logging.basicConfig(
+    level=numeric_level,
+    format="[%(asctime)s] [%(levelname)8s] %(name)s: %(message)s",
+)
+log_boot = logging.getLogger("bootstrap")
+
+# Ensure cache dir exists
+pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+log_boot.info(f"CACHE_DIR={CACHE_DIR} | LOG_LEVEL={LOG_LEVEL} | KEEP_ALIVE={KEEP_ALIVE}")
+
+# Lightweight heartbeat (only if KEEP_ALIVE=true)
+async def _heartbeat_task():
+    log = logging.getLogger("heartbeat")
+    while True:
+        await asyncio.sleep(60)  # once per minute
+        log.debug("tick")
+
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
