@@ -1,140 +1,166 @@
+# bot.py
 import os
 import traceback
+import datetime as dt
 import discord
 from discord import app_commands
 
-import scanner
+import scanner  # our analysis helpers
 
-# ------------ Config via env (guild/channel optional)
+# -------- ENV (GUILD_ID strongly recommended so commands sync instantly)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional, 18-digit
-CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional, 18-digit
-UNIVERSE_ENV = os.getenv("SCAN_UNIVERSE", "")  # optional: comma-separated tickers
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # 18-digit server ID, optional but recommended
+CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional
+UNIVERSE_ENV = os.getenv("SCAN_UNIVERSE", "")  # comma-separated tickers, optional
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
 
-GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID and GUILD_ID.isdigit() else None
+GUILD = discord.Object(int(GUILD_ID)) if GUILD_ID and GUILD_ID.isdigit() else None
 
+# Default “universe” if SCAN_UNIVERSE isn’t set
 DEFAULT_UNIVERSE = [
-    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","JPM","NFLX",
-    "AVGO","KO","PEP","XOM","CVX","WMT","DIS","BA","INTC","CSCO"
+    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL",
+    "AMD","JPM","NFLX","AVGO","KO","PEP","XOM","CVX","WMT","DIS","BA","INTC","CSCO"
 ]
 UNIVERSE = [x.strip().upper() for x in UNIVERSE_ENV.split(",") if x.strip()] or DEFAULT_UNIVERSE
 
-# ------------ Discord setup (slash-only client)
-intents = discord.Intents.default()  # message_content not needed for slash commands
+# -------- Discord client (slash-only — no message content intent required)
+intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-def ensure_sync_scope():
-    return dict(guild=GUILD_OBJ) if GUILD_OBJ else {}
 
-async def safe_followup(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
+def scope_kwargs():
+    """If GUILD is provided, keep commands guild-scoped for instant updates."""
+    return dict(guild=GUILD) if GUILD else {}
+
+
+async def safe_respond(interaction: discord.Interaction, *, content=None, embed=None, ephemeral=False):
+    """Never throw 'Unknown interaction'. Uses response if unused, otherwise followup."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
         else:
             await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
-    except discord.errors.NotFound:
+    except discord.NotFound:
+        # User navigated away before reply; ignore gracefully
         pass
 
-def color_for(rec: str) -> discord.Color:
-    if rec == "CALL":
-        return discord.Color.green()
-    if rec == "PUT":
-        return discord.Color.red()
-    return discord.Color.gold()
+
+def color_for_bias(bias: str) -> discord.Color:
+    return discord.Color.green() if bias == "CALL" else (discord.Color.red() if bias == "PUT" else discord.Color.gold())
+
 
 @client.event
 async def on_ready():
     try:
-        synced = await tree.sync(**ensure_sync_scope())
-        print(f"✅ Logged in as {client.user} | {len(synced)} commands synced")
+        # Copy guild commands to global when no GUILD is provided (slower to propagate),
+        # but prefer guild-scoped if GUILD is set (instant).
+        if GUILD:
+            await tree.sync(guild=GUILD)
+        else:
+            await tree.sync()
+        print(f"✅ {client.user} ready • commands synced at {dt.datetime.now().isoformat()}")
     except Exception:
         print("Command sync failed:\n", traceback.format_exc())
 
-# ---------------- Slash commands
 
-@tree.command(name="ping", description="Check bot status", **ensure_sync_scope())
+@client.event
+async def on_guild_available(guild: discord.Guild):
+    """Resync on cold starts/reconnects so changed command schemas appear immediately."""
+    try:
+        if GUILD and guild.id == int(GUILD.id):
+            await tree.sync(guild=GUILD)
+            print(f"🔁 Resynced commands for guild {guild.id}")
+    except Exception:
+        print("Resync failed:\n", traceback.format_exc())
+
+
+# ---------------- Slash Commands ----------------
+
+@tree.command(name="ping", description="Check bot status", **scope_kwargs())
 async def ping_cmd(interaction: discord.Interaction):
-    await safe_followup(interaction, "📍 Pong", ephemeral=True)
+    await safe_respond(interaction, content="📍 Pong", ephemeral=True)
 
-@tree.command(name="scan_ticker", description="Analyze one ticker (signals, stats, sentiment)", **ensure_sync_scope())
-@app_commands.describe(ticker="Stock ticker, e.g. NVDA")
+
+@tree.command(name="scan_ticker", description="Analyze one ticker (signals, stats, sentiment)", **scope_kwargs())
+@app_commands.describe(ticker="Stock ticker, e.g., NVDA")
 async def scan_ticker_cmd(interaction: discord.Interaction, ticker: str):
     await interaction.response.defer(thinking=True)
+    t = (ticker or "").strip().upper()
+
     try:
-        data = scanner.analyze_one_ticker(ticker)
-        if not data:
-            await interaction.followup.send(f"❌ Could not analyze **{ticker.upper()}**: no price data.", ephemeral=True)
-            return
+        data = scanner.analyze_one_ticker(t)
+        # Build the card
+        desc = []
+        desc.append(f"**Last:** ${data['last_price']:.2f}")
+        desc.append(f"**1D / 5D / 1M:** {data['change_1d']:.2f}% / {data['change_5d']:.2f}% / {data['change_1m']:.2f}%")
+        desc.append(f"**52W Range:** ${data['low_52']:.2f} – ${data['high_52']:.2f}")
+        desc.append(f"**RSI:** {data['rsi'] if data['rsi'] is not None else '—'} | **MACD Δ:** {data['macd'] if data['macd'] is not None else '—'}")
+        desc.append(f"**EMA20/50:** {data['ema20'] if data['ema20'] is not None else '—'} / {data['ema50'] if data['ema50'] is not None else '—'}")
+        if data['volume_ratio'] is not None:
+            desc.append(f"**Vol/Avg20:** {data['volume_ratio']}x")
+        desc.append(f"**News Sentiment:** {data['sentiment']:+.2f}")
+        why = "\n".join(desc)
 
-        desc_lines = [
-            f"**Last:** ${data['last_price']:.2f}",
-            f"**1D / 5D / 1M:** {data['change_1d']:.2f}% / {data['change_5d']:.2f}% / {data['change_1m']:.2f}%",
-            f"**52W Range:** ${data['low_52']:.2f} – ${data['high_52']:.2f}",
-            f"**RSI:** {data['rsi'] if data['rsi'] is not None else '—'} | **MACD Δ:** {data['macd'] if data['macd'] is not None else '—'}",
-            f"**EMA20/50:** {data['ema20'] if data['ema20'] else '—'} / {data['ema50'] if data['ema50'] else '—'}",
-            f"**Vol/Avg20:** {data['volume_ratio']}x" if data['volume_ratio'] is not None else "",
-            f"**News Sentiment:** {data['sentiment']:+.2f}",
-        ]
-        desc = "\n".join([s for s in desc_lines if s])
-
-        e = discord.Embed(
+        emb = discord.Embed(
             title=f"{data['ticker']} • {data['rec']}",
-            description=desc,
-            color=color_for(data["rec"]),
+            description=why,
+            color=color_for_bias(data['rec'])
         )
-        await interaction.followup.send(embed=e)
-    except Exception as e:
-        print("scan_ticker error:\n", traceback.format_exc())
-        await interaction.followup.send(f"❌ Could not analyze **{ticker.upper()}**: {e}", ephemeral=True)
-
-@tree.command(name="earnings_watch", description="Earnings within ±7 days (or check one ticker)", **ensure_sync_scope())
-@app_commands.describe(ticker="Optional single ticker to check", days="Window in days (default 7)")
-async def earnings_watch_cmd(interaction: discord.Interaction, ticker: str = "", days: int = 7):
-    await interaction.response.defer(thinking=True)
-    try:
-        days = max(1, min(30, int(days)))
+        await interaction.followup.send(embed=emb)
+    except ValueError as ve:
+        await interaction.followup.send(f"❌ Could not analyze **{t}**: {ve}", ephemeral=True)
     except Exception:
-        days = 7
+        print("scan_ticker crash:\n", traceback.format_exc())
+        await interaction.followup.send(f"❌ Could not analyze **{t}** due to an internal error.", ephemeral=True)
+
+
+@tree.command(name="earnings_watch", description="Show earnings within ±days (default 7). Leave ticker blank to scan universe.", **scope_kwargs())
+@app_commands.describe(ticker="Optional single ticker (e.g., JPM)", days="Window size in days (1–30). Default 7.")
+async def earnings_watch_cmd(interaction: discord.Interaction, ticker: str | None = None, days: int = 7):
+    await interaction.response.defer(thinking=True)
 
     try:
-        tickers = [ticker] if ticker else UNIVERSE
-        matches = scanner.earnings_within_window(tickers, days=days)
+        window = max(1, min(30, int(days)))
+    except Exception:
+        window = 7
+
+    try:
+        tickers = [ticker.strip().upper()] if ticker else UNIVERSE
+        matches = scanner.earnings_within_window(tickers, days=window)
         if not matches:
-            scope = ticker.upper() if ticker else "current universe"
-            await interaction.followup.send(f"No earnings within ±{days} days for **{scope}**.")
+            scope = (ticker or "current universe").upper() if ticker else "current universe"
+            await interaction.followup.send(f"No earnings within ±{window} days for **{scope}**.")
             return
 
-        lines = [f"**{t}** → {d.isoformat()}" for t, d in matches]
-        e = discord.Embed(
-            title=f"Earnings within ±{days} days",
+        lines = [f"**{t}** → {d.strftime('%Y-%m-%d')}" for t, d in matches]
+        emb = discord.Embed(
+            title=f"Earnings within ±{window} days",
             description="\n".join(lines),
-            color=discord.Color.blurple(),
+            color=discord.Color.blurple()
         )
-        await interaction.followup.send(embed=e)
-    except Exception as e:
-        print("earnings_watch error:\n", traceback.format_exc())
-        await interaction.followup.send(f"❌ Earnings watch failed: {e}", ephemeral=True)
+        await interaction.followup.send(embed=emb)
+    except Exception:
+        print("earnings_watch crash:\n", traceback.format_exc())
+        await interaction.followup.send("❌ Earnings watch failed due to an internal error.", ephemeral=True)
 
-@tree.command(name="help", description="Show commands and how to read signals", **ensure_sync_scope())
+
+@tree.command(name="help", description="Show commands and how to read signals", **scope_kwargs())
 async def help_cmd(interaction: discord.Interaction):
-    e = discord.Embed(
-        title="Scanner Help",
-        description=(
-            "Commands\n"
-            "• `/scan_ticker SYMBOL` — analyze one ticker\n"
-            "• `/earnings_watch [ticker] [days]` — earnings within ±days (default 7)\n\n"
-            "How to read a signal\n"
-            "• **Bias:** CALL (green) or PUT (red) from trend+momentum\n"
-            "• **Buy Range:** use EMA20/50 and pullbacks\n"
-            "• **Target/Stop:** use recent swing high/low\n"
-            "• **Risk:** liquidity/volatility heuristics\n"
-        ),
-        color=discord.Color.dark_grey(),
+    text = (
+        "**Commands**\n"
+        "• `/scan_ticker SYMBOL` — analyze one ticker (signals/stats/sentiment)\n"
+        "• `/earnings_watch [ticker] [days]` — earnings within ±days (default 7)\n\n"
+        "**How to read a signal**\n"
+        "• **Bias:** CALL (green) or PUT (red) from trend + momentum\n"
+        "• **Buy Range:** watch pullbacks vs EMA20/EMA50\n"
+        "• **Target/Stop:** recent swing levels\n"
+        "• **Risk:** liquidity/volatility heuristics\n"
     )
-    await safe_followup(interaction, embed=e, ephemeral=True)
+    emb = discord.Embed(title="Scanner Help", description=text, color=discord.Color.dark_grey())
+    await safe_respond(interaction, embed=emb, ephemeral=True)
+
 
 client.run(TOKEN)
