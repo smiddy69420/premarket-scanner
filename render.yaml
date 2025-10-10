@@ -6,10 +6,10 @@ services:
     startCommand: python bot.py
     envVars:
       - key: DISCORD_BOT_TOKEN
-        sync: false     # set the secret in Render dashboard
+        sync: false          # set this secret in Render dashboard
       - key: DISCORD_GUILD_ID
         value: "1425873583170781324"
       - key: DISCORD_CHANNEL_ID
         value: "1425873791145480292"
       - key: SCAN_UNIVERSE
-        value: "AAPL,MSFT,NVDA,TSLA,AMZN,META,GOOGL,AMD,JPM,NFLX,AVGO,KO,PEP,XOM,CVX,WMT,DIS,BA,INTC,CSCO"
+        value: "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"   # optional
