@@ -1,196 +1,105 @@
-# scanner.py
-import datetime as dt
-from typing import Tuple, Optional, Dict, Any, List
-
-import numpy as np
-import pandas as pd
 import yfinance as yf
-from ta.trend import EMAIndicator, MACD
-from ta.momentum import RSIIndicator
+import pandas as pd
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import datetime
 
+analyzer = SentimentIntensityAnalyzer()
 
-# ---------- Utilities ----------
-
-def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [' '.join([str(x) for x in tup if x is not None]).strip() for tup in df.columns]
-    return df
-
-
-def _standardize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    df = _flatten_columns(df).copy()
-    cols = {c.lower().strip(): c for c in df.columns}
-    # Map common variations
-    if 'close' not in cols and 'adj close' in cols:
-        df['Close'] = df[cols['adj close']]
-    elif 'close' in cols:
-        df['Close'] = df[cols['close']]
-
-    if 'open' in cols:   df['Open']   = df[cols['open']]
-    if 'high' in cols:   df['High']   = df[cols['high']]
-    if 'low' in cols:    df['Low']    = df[cols['low']]
-    if 'volume' in cols: df['Volume'] = df[cols['volume']]
-
-    needed = ['Open', 'High', 'Low', 'Close', 'Volume']
-    if not set(needed).issubset(df.columns):
-        return pd.DataFrame()
-
-    return df[needed].dropna(how='any')
-
-
-def fetch_price_df(symbol: str, auto_adjust: bool = False) -> pd.DataFrame:
-    """
-    Robust yfinance fetch with multiple fallbacks:
-    1) 1d/1m → 2) 5d/5m → 3) 30d/1h → 4) 1y/1d
-    """
-    symbol = symbol.upper().strip()
-    t = yf.Ticker(symbol)
-    attempts: List[Tuple[str, str]] = [
-        ("1d",  "1m"),
-        ("5d",  "5m"),
-        ("30d", "1h"),
-        ("1y",  "1d"),
-    ]
-    for period, interval in attempts:
-        try:
-            df = t.history(period=period, interval=interval, auto_adjust=auto_adjust,
-                           prepost=True, actions=False)
-            df = _standardize_ohlcv(df)
-            if not df.empty and df['Close'].ndim == 1:
-                return df
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    n = len(out)
-
-    ema20_win = min(20, max(2, n // 6))
-    ema50_win = min(50, max(3, n // 3))
-    macd_fast = 12 if n >= 12 else max(2, n // 4)
-    macd_slow = 26 if n >= 26 else max(3, n // 3)
-    macd_sig  = 9  if n >= 9  else max(2, n // 5)
-
-    out['EMA20'] = EMAIndicator(close=out['Close'], window=ema20_win).ema_indicator()
-    out['EMA50'] = EMAIndicator(close=out['Close'], window=ema50_win).ema_indicator()
-
-    macd = MACD(close=out['Close'], window_slow=macd_slow, window_fast=macd_fast, window_sign=macd_sig)
-    out['MACD'] = macd.macd()
-    out['MACD_SIG'] = macd.macd_signal()
-
-    out['RSI'] = RSIIndicator(close=out['Close'], window=min(14, max(2, n // 8))).rsi()
-    return out.dropna(how='any')
-
-
-def classify_signal(df: pd.DataFrame) -> Tuple[str, List[str]]:
-    if df.empty:
-        return "NEUTRAL", ["No data"]
-    last = df.iloc[-1]
-    close, ema20, ema50 = last['Close'], last['EMA20'], last['EMA50']
-    macd, macd_sig = last['MACD'], last['MACD_SIG']
-    rsi = float(last['RSI'])
-
-    reasons = []
-    if close > ema20 > ema50:
-        trend = "Uptrend";   reasons.append("Close > EMA20 > EMA50")
-    elif close < ema20 < ema50:
-        trend = "Downtrend"; reasons.append("Close < EMA20 < EMA50")
-    else:
-        trend = "Sideways";  reasons.append("Mixed EMAs")
-
-    reasons.append("MACD momentum up" if macd > macd_sig else "MACD momentum down")
-    reasons.append(f"RSI {rsi:.1f}")
-
-    if trend == "Uptrend" and macd > macd_sig and rsi >= 50:
-        sig = "CALL"
-    elif trend == "Downtrend" and macd < macd_sig and rsi <= 50:
-        sig = "PUT"
-    else:
-        sig = "NEUTRAL"
-    return sig, reasons
-
-
-def analyze_one(symbol: str) -> Dict[str, Any]:
-    df = fetch_price_df(symbol)
-    if df.empty:
-        return {"ok": False, "symbol": symbol.upper(), "error": "No price data returned"}
-
-    df = compute_indicators(df)
-    if df.empty or 'Close' not in df.columns:
-        return {"ok": False, "symbol": symbol.upper(), "error": "Close series unavailable after processing"}
-
-    price = float(df['Close'].iloc[-1])
-    signal, reasons = classify_signal(df)
-    return {"ok": True, "symbol": symbol.upper(), "price": price, "signal": signal, "reasons": reasons}
-
-
-# Backwards-compat: keep the old name that your bot was calling
-def analyze_one_ticker(symbol: str) -> Dict[str, Any]:
-    return analyze_one(symbol)
-
-
-# ---------- Earnings (± window) ----------
-
-def _nearest_earnings_from_df(edf: pd.DataFrame, days_window: int) -> Optional[pd.Timestamp]:
-    if edf is None or edf.empty:
-        return None
-
-    # Accept either datetime index or a column that looks like a date
-    if isinstance(edf.index, pd.DatetimeIndex):
-        dates = edf.index
-    else:
-        col = next((c for c in edf.columns if str(c).lower().startswith("earnings")), None)
-        if col is None:
-            return None
-        dates = pd.to_datetime(edf[col], errors="coerce").dropna()
-
-    if len(dates) == 0:
-        return None
-
-    today = pd.Timestamp.utcnow().normalize()
-    win_lo = today - pd.Timedelta(days=days_window)
-    win_hi = today + pd.Timedelta(days=days_window)
-    in_win = [pd.Timestamp(d).normalize() for d in list(dates) if win_lo <= pd.Timestamp(d).normalize() <= win_hi]
-    if not in_win:
-        return None
-    return min(in_win, key=lambda d: abs((d - today).days))
-
-
-def earnings_watch_text(symbol: str, days_window: int = 7) -> str:
-    symbol = symbol.upper().strip()
-    t = yf.Ticker(symbol)
-
-    target: Optional[pd.Timestamp] = None
+def analyze_one_ticker(ticker: str):
     try:
-        edf = t.get_earnings_dates(limit=12)
-        target = _nearest_earnings_from_df(edf, days_window)
-    except Exception:
-        target = None
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="6mo", interval="1d")
 
-    if target is None:
+        if hist.empty:
+            return None
+
+        # Basic metrics
+        last_price = hist["Close"].iloc[-1]
+        change_1d = ((hist["Close"].iloc[-1] / hist["Close"].iloc[-2]) - 1) * 100
+        change_5d = ((hist["Close"].iloc[-1] / hist["Close"].iloc[-6]) - 1) * 100 if len(hist) > 6 else 0
+        change_1m = ((hist["Close"].iloc[-1] / hist["Close"].iloc[-21]) - 1) * 100 if len(hist) > 21 else 0
+        high_52 = hist["High"].max()
+        low_52 = hist["Low"].min()
+
+        # Volume comparison
+        avg_volume = hist["Volume"].tail(20).mean()
+        current_volume = hist["Volume"].iloc[-1]
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+
+        # Technicals
+        ema20 = hist["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = hist["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+        rsi = compute_rsi(hist["Close"], 14)
+        macd_signal = compute_macd(hist["Close"])
+
+        # News sentiment
+        news = stock.news
+        headlines = [n["title"] for n in news[:5]] if news else []
+        sentiment = (
+            sum(analyzer.polarity_scores(title)["compound"] for title in headlines) / len(headlines)
+            if headlines else 0
+        )
+
+        rec = (
+            "CALL" if last_price > ema20 > ema50 and macd_signal > 0 and rsi < 70
+            else "PUT" if last_price < ema20 < ema50 and macd_signal < 0 and rsi > 30
+            else "HOLD"
+        )
+
+        return {
+            "ticker": ticker.upper(),
+            "rec": rec,
+            "last_price": last_price,
+            "change_1d": change_1d,
+            "change_5d": change_5d,
+            "change_1m": change_1m,
+            "high_52": high_52,
+            "low_52": low_52,
+            "volume_ratio": volume_ratio,
+            "rsi": rsi,
+            "macd": macd_signal,
+            "sentiment": sentiment,
+        }
+
+    except Exception as e:
+        print(f"Error analyzing {ticker}: {e}")
+        return None
+
+
+def compute_rsi(series, period=14):
+    delta = series.diff(1).dropna()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi.iloc[-1], 2)
+
+
+def compute_macd(series):
+    exp1 = series.ewm(span=12, adjust=False).mean()
+    exp2 = series.ewm(span=26, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return round(macd.iloc[-1] - signal.iloc[-1], 2)
+
+
+def earnings_watch_text(days_ahead=7):
+    """Return tickers with earnings within ±days_ahead."""
+    today = datetime.date.today()
+    upcoming = []
+    for t in ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "JPM", "AMD"]:
         try:
-            cal = t.calendar
-            if cal is not None and not cal.empty:
-                values = []
-                for col in cal.columns:
-                    values.extend(list(cal[col].values))
-                dates = pd.to_datetime(pd.Series(values), errors="coerce").dropna()
-                if not dates.empty:
-                    candidate = pd.Timestamp(dates.iloc[0]).normalize()
-                    today = pd.Timestamp.utcnow().normalize()
-                    if abs((candidate - today).days) <= days_window:
-                        target = candidate
+            stock = yf.Ticker(t)
+            cal = stock.calendar
+            if "Earnings Date" in cal:
+                date = pd.to_datetime(cal.loc["Earnings Date"][0]).date()
+                if abs((date - today).days) <= days_ahead:
+                    upcoming.append((t, date))
         except Exception:
             pass
-
-    if target is None:
-        return f"🗓️ **{symbol}** — No earnings found within ±{days_window} days."
-
-    iso = target.strftime("%Y-%m-%d")
-    delta = (target - pd.Timestamp.utcnow().normalize()).days
-    when = "today" if delta == 0 else (f"in **{delta}** days" if delta > 0 else f"**{abs(delta)}** days ago")
-    return f"🗓️ **{symbol}** — Earnings on **{iso}** ({when})."
+    if not upcoming:
+        return "No earnings within ±7 days."
+    lines = [f"**{t}** → {d}" for t, d in upcoming]
+    return "\n".join(lines)
