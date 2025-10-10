@@ -1,7 +1,6 @@
 # scanner.py
-import os
 import datetime as dt
-from typing import List, Dict, Optional, Tuple
+from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -10,352 +9,243 @@ from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 
 
-# ----------------------------
-# Config / Universe helpers
-# ----------------------------
+# ---------- Utilities ----------
 
-def get_universe_from_env() -> List[str]:
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [' '.join([str(x) for x in tup if x is not None]).strip() for tup in df.columns]
+    return df
+
+
+def _standardize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    df = _flatten_columns(df).copy()
+    cols = {c.lower().strip(): c for c in df.columns}
+    # Map common variations
+    if 'close' not in cols and 'adj close' in cols:
+        df['Close'] = df[cols['adj close']]
+    elif 'close' in cols:
+        df['Close'] = df[cols['close']]
+
+    if 'open' in cols:   df['Open']   = df[cols['open']]
+    if 'high' in cols:   df['High']   = df[cols['high']]
+    if 'low' in cols:    df['Low']    = df[cols['low']]
+    if 'volume' in cols: df['Volume'] = df[cols['volume']]
+
+    needed = ['Open', 'High', 'Low', 'Close', 'Volume']
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        # Try to coerce if possible; otherwise return empty
+        return pd.DataFrame()
+
+    # Clean NaNs
+    df = df[needed].dropna(how='any')
+    return df
+
+
+def fetch_price_df(
+    symbol: str,
+    auto_adjust: bool = False,
+    max_attempts: int = 4
+) -> pd.DataFrame:
     """
-    Read a comma-separated universe from env UNIVERSE_CSV, or use a reasonable default.
-    You can set UNIVERSE_CSV in Render like: AAPL,MSFT,AMZN,GOOGL,META,NVDA,TSLA,AMD,BA,KO,PEP,WMT,ORCL,INTC,CRM,UNH,T
+    Robust yfinance fetch with multiple fallbacks:
+    1) 1d / 1m
+    2) 5d / 5m
+    3) 30d / 1h
+    4) 1y / 1d
+    Returns standardized OHLCV or empty DataFrame.
     """
-    csv = os.environ.get("UNIVERSE_CSV", "")
-    if csv.strip():
-        u = [s.strip().upper() for s in csv.split(",") if s.strip()]
-        return sorted(list(dict.fromkeys(u)))
-    # Default large-cap core (stable + liquid)
-    return [
-        "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AMD","INTC","AVGO",
-        "KO","PEP","WMT","COST","BA","ORCL","CRM","DIS","NFLX","T","V","MA",
-        "JPM","BAC","XOM","CVX","WFC","HD","LOW","UNH","PFE","MRK","ABBV",
-        "ADBE","SHOP","QCOM","PYPL","CSCO","IBM","NKE","MCD","GE","CAT",
+    symbol = symbol.upper().strip()
+    t = yf.Ticker(symbol)
+    attempts: List[Tuple[str, str]] = [
+        ("1d",  "1m"),
+        ("5d",  "5m"),
+        ("30d", "1h"),
+        ("1y",  "1d"),
     ]
-
-
-# ----------------------------
-# Data / Indicators
-# ----------------------------
-
-def fetch_price_history(ticker: str, period: str = "5d", interval: str = "5m") -> Optional[pd.DataFrame]:
-    """
-    Return OHLCV with a clean DatetimeIndex. None if empty.
-    """
-    try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            return None
-        # Normalize columns (yfinance sometimes gives lowercase)
-        df = df.rename(columns={c: c.title() for c in df.columns})
-        # Ensure expected columns exist
-        for col in ["Open","High","Low","Close","Volume"]:
-            if col not in df.columns:
-                return None
-        # Drop dupes, sort
-        df = df[["Open","High","Low","Close","Volume"]].copy()
-        df = df[~df.index.duplicated(keep="last")]
-        df = df.sort_index()
-        return df
-    except Exception:
-        return None
+    tried = 0
+    for period, interval in attempts:
+        try:
+            df = t.history(period=period, interval=interval, auto_adjust=auto_adjust, prepost=True, actions=False)
+            df = _standardize_ohlcv(df)
+            if not df.empty and df['Close'].ndim == 1:
+                return df
+        except Exception:
+            pass
+        tried += 1
+        if tried >= max_attempts:
+            break
+    return pd.DataFrame()
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add EMA20, EMA50, RSI, MACD and return same-length dataframe.
+    Adds EMA20, EMA50, MACD, MACD Signal, RSI(14)
     """
-    close = pd.Series(df["Close"].astype(float), index=df.index)
-    ema20 = EMAIndicator(close=close, window=20, fillna=False).ema_indicator()
-    ema50 = EMAIndicator(close=close, window=50, fillna=False).ema_indicator()
+    if df.empty:
+        return df
 
-    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=False)
-    rsi = RSIIndicator(close=close, window=14, fillna=False).rsi()
+    out = df.copy()
+    # Use safe lengths relative to available rows
+    n = len(out)
+    span_fast = 12 if n >= 12 else max(2, n // 4)
+    span_slow = 26 if n >= 26 else max(3, n // 3)
+    span_signal = 9 if n >= 9 else max(2, n // 5)
 
-    df = df.copy()
-    df["EMA20"] = ema20
-    df["EMA50"] = ema50
-    df["MACD"] = macd.macd()
-    df["MACD_Signal"] = macd.macd_signal()
-    df["MACD_Hist"] = macd.macd_diff()
-    df["RSI"] = rsi
-    return df
+    out['EMA20'] = EMAIndicator(close=out['Close'], window=min(20, max(2, n // 6))).ema_indicator()
+    out['EMA50'] = EMAIndicator(close=out['Close'], window=min(50, max(3, n // 3))).ema_indicator()
+
+    macd = MACD(close=out['Close'], window_slow=span_slow, window_fast=span_fast, window_sign=span_signal)
+    out['MACD'] = macd.macd()
+    out['MACD_SIG'] = macd.macd_signal()
+
+    out['RSI'] = RSIIndicator(close=out['Close'], window=min(14, max(2, n // 8))).rsi()
+
+    return out.dropna(how='any')
 
 
-# ----------------------------
-# Earnings (± window days)
-# ----------------------------
-
-def get_next_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
+def classify_signal(df: pd.DataFrame) -> Tuple[str, List[str]]:
     """
-    Best-effort: yfinance get_earnings_dates can break for some tickers.
-    Return a pandas Timestamp (UTC-naive) or None.
+    Simple trend/momentum classification with reasons.
     """
-    try:
-        t = yf.Ticker(ticker)
-        # yfinance has get_earnings_dates(limit=...) returning a df with index as dates
-        df = t.get_earnings_dates(limit=8)
-        if df is None or df.empty:
-            return None
-        # Choose nearest upcoming (>= today) else most recent
-        today = dt.date.today()
-        dates = [pd.Timestamp(d).date() for d in df.index.to_list()]
-        upcoming = [d for d in dates if d >= today]
-        chosen = (min(upcoming) if upcoming else max(dates))
-        return pd.Timestamp(chosen)
-    except Exception:
-        return None
+    reasons = []
+    if df.empty:
+        return "NEUTRAL", ["No data"]
+
+    last = df.iloc[-1]
+    close, ema20, ema50 = last['Close'], last['EMA20'], last['EMA50']
+    macd, macd_sig = last['MACD'], last['MACD_SIG']
+    rsi = float(last['RSI'])
+
+    # Trend
+    if close > ema20 > ema50:
+        trend = "Uptrend"
+        reasons.append("Close > EMA20 > EMA50")
+    elif close < ema20 < ema50:
+        trend = "Downtrend"
+        reasons.append("Close < EMA20 < EMA50")
+    else:
+        trend = "Sideways"
+        reasons.append("Mixed EMAs")
+
+    # Momentum
+    if macd > macd_sig:
+        reasons.append("MACD momentum up")
+    else:
+        reasons.append("MACD momentum down")
+
+    # RSI
+    reasons.append(f"RSI {rsi:.1f}")
+
+    # Final signal
+    if trend == "Uptrend" and macd > macd_sig and rsi >= 50:
+        sig = "CALL"
+    elif trend == "Downtrend" and macd < macd_sig and rsi <= 50:
+        sig = "PUT"
+    else:
+        sig = "NEUTRAL"
+
+    return sig, reasons
 
 
-def earnings_watch_text(symbols: List[str], days_window: int = 7) -> str:
+def analyze_one(symbol: str) -> Dict[str, Any]:
     """
-    Return a friendly text block of tickers with earnings within ±days_window of today.
+    Returns dict with fields:
+      ok, error, symbol, price, signal, reasons
     """
-    today = dt.date.today()
-    start = today - dt.timedelta(days=days_window)
-    end = today + dt.timedelta(days=days_window)
-
-    lines = []
-    for sym in symbols:
-        ed = get_next_earnings_date(sym)
-        if ed is None:
-            continue
-        d = ed.date()
-        if start <= d <= end:
-            sign = "🟢 Today" if d == today else ("🔜 Upcoming" if d > today else "🟡 Recent")
-            lines.append(f"• **{sym}** — {d.isoformat()} ({sign})")
-
-    if not lines:
-        return f"No earnings within ±{days_window} days."
-    lines.sort()
-    return "**Earnings (±{0} days)**\n".format(days_window) + "\n".join(lines)
-
-
-# ----------------------------
-# Simple Scorer & Signal Builder
-# ----------------------------
-
-def last_row(df: pd.DataFrame) -> pd.Series:
-    return df.iloc[-1]
-
-def build_signal(ticker: str, df: pd.DataFrame) -> Optional[Dict]:
-    """
-    Build a single signal dict for the latest bar.
-    CALL if Close > EMA20 > EMA50, PUT if Close < EMA20 < EMA50; else None.
-    """
-    try:
-        row = last_row(df)
-        c = float(row["Close"])
-        ema20 = float(row["EMA20"])
-        ema50 = float(row["EMA50"])
-        rsi = float(row["RSI"])
-        macd_hist = float(row["MACD_Hist"])
-
-        # Trend logic
-        if c > ema20 > ema50:
-            bias = "CALL"
-        elif c < ema20 < ema50:
-            bias = "PUT"
-        else:
-            return None
-
-        # Basic score (positive for CALL strength, negative for PUT strength)
-        score = 0.0
-        score += (abs(ema20 - ema50) / max(1e-9, ema50)) * 100
-        score += (macd_hist * 10.0)
-        score += (70 - abs(50 - rsi)) * 0.05  # RSI away from 50 adds a little conviction
-
-        # Lightweight buy/target/stop around the last price
-        # CALL: slightly above; PUT: slightly below
-        if bias == "CALL":
-            buy_low, buy_high = c - 0.10, c - 0.02
-            target = c + 0.40
-            stop = c - 0.25
-        else:
-            buy_low, buy_high = c + 0.02, c + 0.10
-            target = c - 0.40
-            stop = c + 0.25
-
-        # Why string
-        reasons = []
-        if bias == "CALL":
-            reasons.append("Uptrend (Close>EMA20>EMA50)")
-            if macd_hist > 0: reasons.append("MACD momentum up")
-        else:
-            reasons.append("Downtrend (Close<EMA20<EMA50)")
-            if macd_hist < 0: reasons.append("MACD momentum down")
-        reasons.append(f"RSI {rsi:.1f}")
-
-        return {
-            "ticker": ticker,
-            "price": c,
-            "score": round(score, 2),
-            "type": bias,
-            "buy_range": (round(buy_low, 2), round(buy_high, 2)),
-            "target": round(target, 2),
-            "stop": round(stop, 2),
-            "risk": "Medium",
-            "why": "; ".join(reasons),
-            # We keep options info optional; filled by try_fetch_option_block
-        }
-    except Exception:
-        return None
-
-
-def try_fetch_option_block(ticker: str, bias: str) -> Optional[Dict]:
-    """
-    Best-effort: fetch a nearby monthly contract and return a light liquidity/spread summary.
-    If anything fails, return None (don’t crash scans).
-    """
-    try:
-        t = yf.Ticker(ticker)
-        exps = t.options
-        if not exps:
-            return None
-
-        # Prefer the 3rd Friday ~monthly if available, else first listed
-        # yfinance gives 'YYYY-MM-DD' strings
-        chosen = None
-        for e in exps:
-            d = pd.Timestamp(e).date()
-            # heuristic: pick the nearest >= 14 days out (gives options some time)
-            if d >= (dt.date.today() + dt.timedelta(days=14)):
-                chosen = e
-                break
-        if chosen is None:
-            chosen = exps[0]
-
-        chain = t.option_chain(chosen)
-        if bias == "CALL":
-            tbl = chain.calls
-        else:
-            tbl = chain.puts
-
-        if tbl is None or tbl.empty:
-            return None
-
-        # Pick strike near the money (median by abs(strike - last_price))
-        last_price = float(t.fast_info["last_price"]) if "last_price" in t.fast_info else None
-        if last_price is None:
-            # fallback to close from history
-            h = fetch_price_history(ticker, period="1d", interval="1m")
-            if h is None or h.empty:
-                return None
-            last_price = float(h["Close"].iloc[-1])
-
-        tbl = tbl.copy()
-        tbl["dist"] = (tbl["strike"] - last_price).abs()
-        near = tbl.sort_values("dist").head(1).squeeze()
-
-        # Compute mid, spread%, Vol, OI
-        bid = float(near.get("bid", np.nan))
-        ask = float(near.get("ask", np.nan))
-        vol = int(near.get("volume", 0)) if not np.isnan(near.get("volume", np.nan)) else 0
-        oi = int(near.get("openInterest", 0)) if not np.isnan(near.get("openInterest", np.nan)) else 0
-        if np.isnan(bid) or np.isnan(ask) or bid <= 0 or ask <= 0:
-            return None
-
-        mid = round((bid + ask) / 2.0, 2)
-        spread_pct = round(((ask - bid) / mid) * 100.0, 1) if mid > 0 else 0.0
-
-        symbol = near.get("contractSymbol")
-        strike = float(near.get("strike", 0.0))
-        return {
-            "expiry": chosen,
-            "contract": symbol,
-            "strike": strike,
-            "mid": mid,
-            "spread_pct": spread_pct,
-            "volume": vol,
-            "oi": oi
-        }
-    except Exception:
-        return None
-
-
-# ----------------------------
-# Public API used by bot.py
-# ----------------------------
-
-def analyze_one_ticker(ticker: str, period: str = "5d", interval: str = "5m") -> Dict:
-    """
-    Analyze a single ticker and return a dict ready to embed.
-    Raises Exception with a helpful message if something blocks analysis.
-    """
-    tk = ticker.upper().strip()
-    df = fetch_price_history(tk, period=period, interval=interval)
-    if df is None or df.empty:
-        raise Exception("No price data returned")
+    df = fetch_price_df(symbol)
+    if df.empty:
+        return {"ok": False, "symbol": symbol.upper(), "error": "No price data returned"}
 
     df = compute_indicators(df)
-    sig = build_signal(tk, df)
-    if not sig:
-        raise Exception("No clear trend signal (not strictly up/down EMA stack)")
+    if df.empty or 'Close' not in df.columns:
+        return {"ok": False, "symbol": symbol.upper(), "error": "Close series unavailable after processing"}
 
-    # Attach earnings note
-    ed = get_next_earnings_date(tk)
-    if ed is not None:
-        # ±7 days flag
-        window = 7
-        d = ed.date()
-        today = dt.date.today()
-        if abs((d - today).days) <= window:
-            sig["risk"] = "High"
-            sig.setdefault("why", "")
-            sig["why"] += f"; Earnings window (±{window}d: {d.isoformat()})"
-
-    # Try options block (best-effort)
-    ob = try_fetch_option_block(tk, sig["type"])
-    if ob:
-        sig["options"] = ob
-
-    return sig
+    price = float(df['Close'].iloc[-1])
+    signal, reasons = classify_signal(df)
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "price": price,
+        "signal": signal,
+        "reasons": reasons,
+    }
 
 
-def scan_universe_and_rank(universe: List[str], top_n: int = 10,
-                           period: str = "5d", interval: str = "5m") -> List[Dict]:
+# ---------- Earnings (± window) ----------
+
+def _nearest_earnings_from_df(edf: pd.DataFrame, days_window: int) -> Optional[pd.Timestamp]:
+    if edf is None or edf.empty:
+        return None
+    # yfinance get_earnings_dates can return index as DatetimeIndex
+    if isinstance(edf.index, pd.DatetimeIndex):
+        dates = edf.index.to_pydatetime()
+    else:
+        # or a column named 'Earnings Date'
+        col_name = None
+        for c in edf.columns:
+            if str(c).lower().startswith("earnings"):
+                col_name = c
+                break
+        if col_name is None:
+            return None
+        dates = pd.to_datetime(edf[col_name], errors='coerce').dropna().to_pydatetime()
+
+    if not len(dates):
+        return None
+
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    window_start = today - pd.Timedelta(days=days_window)
+    window_end = today + pd.Timedelta(days=days_window)
+
+    # keep within window, pick the closest by absolute delta
+    in_win = [pd.Timestamp(d, tz="UTC").normalize() for d in dates if window_start <= pd.Timestamp(d, tz="UTC").normalize() <= window_end]
+    if not in_win:
+        return None
+
+    closest = min(in_win, key=lambda d: abs((d - today).days))
+    return closest
+
+
+def earnings_watch_text(symbol: str, days_window: int = 7) -> str:
     """
-    Analyze a list of tickers, keep those with a clear bias, sort by |score| desc, return top_n
+    Returns a user-friendly sentence summarizing earnings within ±days_window.
     """
-    results = []
-    for tk in universe:
+    symbol = symbol.upper().strip()
+    t = yf.Ticker(symbol)
+
+    # Try new API first
+    edate: Optional[pd.Timestamp] = None
+    try:
+        edf = t.get_earnings_dates(limit=12)
+        edate = _nearest_earnings_from_df(edf, days_window)
+    except Exception:
+        edate = None
+
+    # Fallback to calendar
+    if edate is None:
         try:
-            info = analyze_one_ticker(tk, period=period, interval=interval)
-            results.append(info)
+            cal = t.calendar
+            # calendar may be DataFrame with index including 'Earnings Date'
+            if cal is not None and not cal.empty:
+                # Pull anything that looks like a date
+                vals = []
+                for col in cal.columns:
+                    vals.extend(list(cal[col].values))
+                dates = pd.to_datetime(pd.Series(vals), errors='coerce').dropna()
+                if not dates.empty:
+                    edate_candidate = pd.Timestamp(dates.iloc[0]).tz_localize("UTC") if dates.dt.tz is None else dates.iloc[0]
+                    # treat as event and check window
+                    today = pd.Timestamp.now(tz="UTC").normalize()
+                    if abs((edate_candidate.normalize() - today).days) <= days_window:
+                        edate = edate_candidate.normalize()
         except Exception:
-            continue
+            pass
 
-    if not results:
-        return []
-    results.sort(key=lambda x: abs(x.get("score", 0.0)), reverse=True)
-    return results[:top_n]
+    if edate is None:
+        return f"🗓️ **{symbol}** — No earnings found within ±{days_window} days."
 
-
-def signal_to_embed_fields(sig: Dict) -> Tuple[str, str]:
-    """
-    Return (title, body) for Discord embed.
-    """
-    t = sig["ticker"]
-    c = sig["price"]
-    bias = sig["type"]
-    tgt = sig["target"]
-    stp = sig["stop"]
-    br_lo, br_hi = sig["buy_range"]
-    risk = sig["risk"]
-    why = sig["why"]
-
-    title = f"{t} @ ${c:.2f} → {bias}"
-    body = (
-        f"**Buy Range:** ${br_lo:.2f} – ${br_hi:.2f}\n"
-        f"**Target:** ${tgt:.2f}   |   **Stop:** ${stp:.2f}\n"
-        f"**Risk:** {risk}\n"
-        f"**Why:** {why}\n"
-    )
-
-    if "options" in sig:
-        ob = sig["options"]
-        body += (
-            f"\n**Option Block**\n"
-            f"• `{ob['contract']}` (strike {ob['strike']:.1f}, exp {ob['expiry']})\n"
-            f"• Mid ~ ${ob['mid']:.2f}   |   Spread ~ {ob['spread_pct']:.1f}%\n"
-            f"• Vol {ob['volume']}   |   OI {ob['oi']}\n"
-        )
-    return title, body
+    iso = edate.tz_convert("UTC").strftime("%Y-%m-%d") if edate.tzinfo else edate.strftime("%Y-%m-%d")
+    delta = (edate.normalize() - pd.Timestamp.now(tz="UTC").normalize()).days
+    when = "today" if delta == 0 else ("in **{}** days".format(delta) if delta > 0 else "**{}** days ago".format(abs(delta)))
+    return f"🗓️ **{symbol}** — Earnings on **{iso}** ({when})."
