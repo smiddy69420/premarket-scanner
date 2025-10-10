@@ -24,18 +24,18 @@ services:
       - key: KEEP_ALIVE
         value: "true"
 
-  # Future: Scheduled cron worker (no gateway)
+  # Scheduled/webhook worker — no discord.py import, safe on all Python versions
   - type: worker
     name: premarket-cron
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py --mode=cron
+    startCommand: python webhook_runner.py
     plan: starter
     envVars:
-      - key: DISCORD_BOT_TOKEN
+      - key: DISCORD_WEBHOOK
         sync: false
-      - key: DISCORD_CHANNEL_ID
-        value: "1425873791145480292"
+      - key: PYTHON_VERSION
+        value: "3.12.6"
       - key: TZ
         value: "America/New_York"
       - key: CACHE_DIR
