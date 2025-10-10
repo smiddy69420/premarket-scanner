@@ -1,16 +1,14 @@
 import os
 import traceback
-
 import discord
 from discord import app_commands
-from discord.ext import commands
 
 import scanner
 
 # ------------ Config via env (guild/channel optional)
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional
-CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional, 18-digit
+CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional, 18-digit
 UNIVERSE_ENV = os.getenv("SCAN_UNIVERSE", "")  # optional: comma-separated tickers
 
 if not TOKEN:
@@ -19,19 +17,18 @@ if not TOKEN:
 GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID and GUILD_ID.isdigit() else None
 
 DEFAULT_UNIVERSE = [
-    # solid, liquid names; you can change in env SCAN_UNIVERSE
     "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","JPM","NFLX",
     "AVGO","KO","PEP","XOM","CVX","WMT","DIS","BA","INTC","CSCO"
 ]
 UNIVERSE = [x.strip().upper() for x in UNIVERSE_ENV.split(",") if x.strip()] or DEFAULT_UNIVERSE
 
-# ------------ Discord setup
-intents = discord.Intents.default()
-intents.message_content = False  # not needed for slash commands
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+# ------------ Discord setup (slash-only client)
+intents = discord.Intents.default()  # message_content not needed for slash commands
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-# ------------ Helpers
+def ensure_sync_scope():
+    return dict(guild=GUILD_OBJ) if GUILD_OBJ else {}
 
 async def safe_followup(interaction: discord.Interaction, content=None, embed=None, ephemeral=False):
     try:
@@ -40,7 +37,6 @@ async def safe_followup(interaction: discord.Interaction, content=None, embed=No
         else:
             await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
     except discord.errors.NotFound:
-        # interaction expired; nothing to do
         pass
 
 def color_for(rec: str) -> discord.Color:
@@ -50,24 +46,15 @@ def color_for(rec: str) -> discord.Color:
         return discord.Color.red()
     return discord.Color.gold()
 
-def ensure_sync_scope():
-    # sync local to guild for instant availability if GUILD_ID set,
-    # else global (may take longer first time).
-    if GUILD_OBJ:
-        return dict(guild=GUILD_OBJ)
-    return {}
-
-# ------------ Events
-
-@bot.event
+@client.event
 async def on_ready():
     try:
         synced = await tree.sync(**ensure_sync_scope())
-        print(f"✅ Logged in as {bot.user} | {len(synced)} commands synced")
+        print(f"✅ Logged in as {client.user} | {len(synced)} commands synced")
     except Exception:
         print("Command sync failed:\n", traceback.format_exc())
 
-# ------------ Commands
+# ---------------- Slash commands
 
 @tree.command(name="ping", description="Check bot status", **ensure_sync_scope())
 async def ping_cmd(interaction: discord.Interaction):
@@ -118,7 +105,7 @@ async def earnings_watch_cmd(interaction: discord.Interaction, ticker: str = "",
         matches = scanner.earnings_within_window(tickers, days=days)
         if not matches:
             scope = ticker.upper() if ticker else "current universe"
-            await interaction.followup.send(f"No earnings within ±{days} days for **{scope}**.", ephemeral=False)
+            await interaction.followup.send(f"No earnings within ±{days} days for **{scope}**.")
             return
 
         lines = [f"**{t}** → {d.isoformat()}" for t, d in matches]
@@ -150,4 +137,4 @@ async def help_cmd(interaction: discord.Interaction):
     )
     await safe_followup(interaction, embed=e, ephemeral=True)
 
-bot.run(TOKEN)
+client.run(TOKEN)
