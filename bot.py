@@ -1,143 +1,147 @@
-# bot.py
 import os
-import traceback
+import asyncio
 import datetime as dt
+from typing import Optional
+
 import discord
 from discord import app_commands
-import scanner  # local module
+from discord.ext import tasks
 
-# ---- ENV ----
+import scanner  # our local module
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")           # optional, 18-digit server ID
-CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")       # optional, 18-digit channel ID
-UNIVERSE_ENV = os.getenv("SCAN_UNIVERSE", "")      # optional, comma list
-
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
 
-GUILD = discord.Object(int(GUILD_ID)) if (GUILD_ID and GUILD_ID.isdigit()) else None
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional but recommended
 
-DEFAULT_UNIVERSE = [
-    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","JPM","NFLX",
-    "AVGO","KO","PEP","XOM","CVX","WMT","DIS","BA","INTC","CSCO"
-]
-UNIVERSE = [x.strip().upper() for x in UNIVERSE_ENV.split(",") if x.strip()] or DEFAULT_UNIVERSE
+# Intents: we don't need message content for slash commands
+intents = discord.Intents.default()
+intents.guilds = True
 
-# ---- DISCORD CLIENT ----
-intents = discord.Intents.default()  # slash-only
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+class PremarketBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.synced = False
 
-
-async def safe_respond(interaction: discord.Interaction, *, content=None, embed=None, ephemeral=False):
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+    async def setup_hook(self):
+        # If a guild id is provided, register commands guild-scoped for instant availability.
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
         else:
-            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
-    except discord.NotFound:
-        pass
+            await self.tree.sync()
+
+    async def on_ready(self):
+        # Make sure commands are synced (belt & suspenders).
+        try:
+            if GUILD_ID:
+                await self.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+            else:
+                await self.tree.sync()
+        except Exception as e:
+            print(f"[WARN] Command sync failed: {e}")
+
+        print(f"[INFO] Logged in as {self.user} (id={self.user.id})")
+        # Warm caches in the background (does not block bot)
+        background_cache_refresher.start()
 
 
-def color_for_bias(bias: str) -> discord.Color:
-    return discord.Color.green() if bias == "CALL" else (discord.Color.red() if bias == "PUT" else discord.Color.gold())
+client = PremarketBot()
+tree = client.tree
 
+# -----------------------
+# Slash Commands
+# -----------------------
 
-@client.event
-async def on_ready():
-    try:
-        if GUILD:
-            tree.copy_global_to(guild=GUILD)
-            sg = await tree.sync(guild=GUILD)
-            print(f"🔁 Synced {len(sg)} guild commands to {GUILD.id}")
-        sg2 = await tree.sync()
-        print(f"✅ Synced {len(sg2)} global commands • {dt.datetime.now().isoformat()}")
-        print("Loaded:", [c.name for c in tree.get_commands()])
-    except Exception:
-        print("❌ Command sync failed:\n", traceback.format_exc())
-
-
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    print("Slash command error:", repr(error), "\n", traceback.format_exc())
-    await safe_respond(interaction, content="⚠️ Something went wrong while processing that command.", ephemeral=True)
-
-# ---- COMMANDS ----
-
-@tree.command(name="ping", description="Check bot status")
+@tree.command(name="ping", description="Health check")
 async def ping_cmd(interaction: discord.Interaction):
-    await safe_respond(interaction, content="📍 Pong", ephemeral=True)
+    await interaction.response.defer(thinking=False, ephemeral=True)
+    await interaction.followup.send("📍 Pong", ephemeral=True)
 
 
-@tree.command(name="scan_ticker", description="Analyze one ticker (signals, stats, sentiment)")
-@app_commands.describe(ticker="Stock ticker, e.g., NVDA")
-async def scan_ticker_cmd(interaction: discord.Interaction, ticker: str):
-    await interaction.response.defer(thinking=True)
-    t = (ticker or "").strip().upper()
-    try:
-        data = scanner.analyze_one_ticker(t)
-
-        lines = []
-        lines.append(f"**Last:** ${data['last_price']:.2f}")
-        lines.append(f"**1D / 5D / 1M:** {data['change_1d']:.2f}% / {data['change_5d']:.2f}% / {data['change_1m']:.2f}%")
-        lines.append(f"**52W Range:** ${data['low_52']:.2f} – ${data['high_52']:.2f}")
-        lines.append(f"**EMA20/50:** {data['ema20'] if data['ema20'] is not None else '—'} / {data['ema50'] if data['ema50'] is not None else '—'}")
-        lines.append(f"**RSI:** {data['rsi'] if data['rsi'] is not None else '—'} | **MACD Δ:** {data['macd'] if data['macd'] is not None else '—'}")
-        if data['volume_ratio'] is not None:
-            lines.append(f"**Vol/Avg20:** {data['volume_ratio']}x")
-        lines.append(f"**News Sentiment:** {data['sentiment']:+.2f}")
-        if data.get('earnings_date'):
-            lines.append(f"**Nearest Earnings:** {data['earnings_date']}")
-        emb = discord.Embed(title=f"{data['ticker']} • {data['rec']}", description="\n".join(lines), color=color_for_bias(data['rec']))
-        await interaction.followup.send(embed=emb)
-    except ValueError as ve:
-        await interaction.followup.send(f"❌ Could not analyze **{t}**: {ve}", ephemeral=True)
-    except Exception:
-        print("scan_ticker crash:\n", traceback.format_exc())
-        await interaction.followup.send(f"❌ Could not analyze **{t}** due to an internal error.", ephemeral=True)
-
-
-@tree.command(
-    name="earnings_watch",
-    description="Show earnings within ±days (default 7). Leave ticker blank to scan the universe."
-)
-@app_commands.describe(ticker="Optional single ticker (e.g., JPM)", days="Window size in days (1–30). Default 7.")
-async def earnings_watch_cmd(interaction: discord.Interaction, ticker: str | None = None, days: int = 7):
-    await interaction.response.defer(thinking=True)
-    try:
-        window = max(1, min(30, int(days)))
-    except Exception:
-        window = 7
-
-    try:
-        tickers = [ticker.strip().upper()] if ticker else UNIVERSE
-        matches = scanner.earnings_within_window(tickers, days=window)
-        if not matches:
-            scope = (ticker or "current universe").upper() if ticker else "current universe"
-            await interaction.followup.send(f"No earnings within ±{window} days for **{scope}**.")
-            return
-        out = [f"**{t}** → {d.strftime('%Y-%m-%d')}" for t, d in matches]
-        emb = discord.Embed(title=f"Earnings within ±{window} days", description="\n".join(out), color=discord.Color.blurple())
-        await interaction.followup.send(embed=emb)
-    except Exception:
-        print("earnings_watch crash:\n", traceback.format_exc())
-        await interaction.followup.send("❌ Earnings watch failed due to an internal error.", ephemeral=True)
-
-
-@tree.command(name="help", description="Show commands and how to read signals")
+@tree.command(name="help", description="Show commands and how to read outputs")
 async def help_cmd(interaction: discord.Interaction):
-    text = (
-        "**Commands**\n"
-        "• `/scan_ticker SYMBOL` — analyze one ticker (signals/stats/sentiment)\n"
-        "• `/earnings_watch [ticker] [days]` — earnings within ±days (default 7)\n\n"
-        "**How to read a signal**\n"
-        "• **Bias:** CALL (green) or PUT (red) from trend + momentum\n"
-        "• **Buy Range:** watch pullbacks vs EMA20/EMA50\n"
-        "• **Target/Stop:** recent swing levels\n"
-        "• **Risk:** liquidity/volatility heuristics\n"
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    embed = discord.Embed(
+        title="🤖 Scanner Help",
+        color=0x5865F2,
+        description=(
+            "Commands:\n"
+            "• `/scan_ticker SYMBOL` — analyze one ticker (trend/momentum/RSI/MACD, ranges, vol vs avg, ATM option)\n"
+            "• `/earnings_watch days:<1–30> [ticker:<symbol>]` — upcoming earnings. "
+            "If `ticker` omitted, scans the whole market and paginates results.\n\n"
+            "**How to read a /scan_ticker card**\n"
+            "• **Bias** CALL/PUT from multi-signal blend\n"
+            "• **Last / 1D/5D/1M** price & changes\n"
+            "• **EMA20/EMA50, RSI14, MACD Δ**, **Vol/Avg20**\n"
+            "• **Option**: ~7–21 DTE, ATM contract with mid & spread\n"
+        ),
     )
-    emb = discord.Embed(title="Scanner Help", description=text, color=discord.Color.dark_grey())
-    await safe_respond(interaction, embed=emb, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-client.run(TOKEN)
+@tree.command(name="scan_ticker", description="Analyze one ticker on demand, e.g. NVDA")
+@app_commands.describe(symbol="Ticker symbol, e.g. NVDA")
+async def scan_ticker_cmd(interaction: discord.Interaction, symbol: str):
+    symbol = symbol.upper().strip()
+    await interaction.response.defer(thinking=True)
+
+    try:
+        card = await asyncio.to_thread(scanner.analyze_one_ticker, symbol)
+        if not card:
+            raise RuntimeError("No price data returned.")
+
+        await interaction.followup.send(embed=scanner.render_ticker_embed(card))
+    except Exception as e:
+        await interaction.followup.send(f"❌ Could not analyze **{symbol}**: {e}")
+
+
+@tree.command(name="earnings_watch", description="Earnings in the next N days (1–30). Optional ticker filter.")
+@app_commands.describe(days="Days ahead (1–30)", ticker="Optional ticker to check a single name")
+async def earnings_watch_cmd(interaction: discord.Interaction, days: app_commands.Range[int, 1, 30], ticker: Optional[str] = None):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        if ticker:
+            ticker = ticker.upper().strip()
+            result = await asyncio.to_thread(scanner.earnings_for_ticker, ticker, days)
+            if result:
+                embed = scanner.render_earnings_single_embed(result, days)
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.followup.send(f"No earnings within ±{days} days for **{ticker}**.")
+            return
+
+        # Full universe scan (cached + background warmed)
+        rows = await asyncio.to_thread(scanner.earnings_universe_window, days)
+        if not rows:
+            await interaction.followup.send(f"No earnings within ±{days} days for the current universe.")
+            return
+
+        # Paginate 25 per embed
+        pages = scanner.chunk(rows, 25)
+        for i, page in enumerate(pages, start=1):
+            embed = scanner.render_earnings_page_embed(page, days, i, len(pages))
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(f"❌ Earnings watch failed: {e}")
+
+
+# -----------------------
+# Background cache refresh
+# -----------------------
+
+@tasks.loop(hours=12)
+async def background_cache_refresher():
+    try:
+        await asyncio.to_thread(scanner.refresh_all_caches)
+    except Exception as e:
+        print(f"[WARN] background_cache_refresher error: {e}")
+
+
+if __name__ == "__main__":
+    client.run(TOKEN)
