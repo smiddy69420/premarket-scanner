@@ -5,10 +5,11 @@ import sys
 import time
 from typing import Dict, Iterable, List, Optional, Set
 import requests
+from pathlib import Path
 
 ROBINHOOD_INSTRUMENTS = "https://api.robinhood.com/instruments/"
 
-# U.S. lit exchanges (exclude OTC)
+# U.S. lit exchanges (exclude OTC/grey)
 ALLOWED_US_MICS: Set[str] = {
     "XNAS",  # NASDAQ
     "XNGS",  # NASDAQ Global Select
@@ -20,104 +21,67 @@ ALLOWED_US_MICS: Set[str] = {
 
 def fetch_instruments(session: requests.Session) -> Iterable[Dict]:
     url = ROBINHOOD_INSTRUMENTS
-    params = {
-        "active_instruments_only": "true",
-        "tradable": "true",
-        # server paginates; leave page size default for safety
-    }
+    params = {"active_instruments_only": "true", "tradable": "true"}
     while url:
         r = session.get(url, params=params if url == ROBINHOOD_INSTRUMENTS else None, timeout=30)
         r.raise_for_status()
         data = r.json()
-        results = data.get("results", [])
-        for inst in results:
+        for inst in data.get("results", []):
             yield inst
         url = data.get("next")
-        # be polite
-        time.sleep(0.05)
+        time.sleep(0.05)  # polite paging
 
 def instrument_is_us_common(inst: Dict, allowed_mics: Set[str]) -> bool:
-    # Must be active & tradable
     if inst.get("state") != "active":
         return False
     if not inst.get("tradeable", False):
         return False
-
-    # Must be a common stock (RH 'type' field)
-    # Known non-common values: 'etp', 'warrant', 'unit', 'adr', 'preferred', 'right'
-    if inst.get("type") != "stock":
+    if inst.get("type") != "stock":  # exclude etp/adr/warrant/unit/etc.
         return False
 
-    # Market MIC must be one of the allowed U.S. lit exchanges
     market = inst.get("market")
     mic = None
     if isinstance(market, dict):
         mic = market.get("mic")
-    # Some API pages return a URL string for 'market'; we can’t deref here, so keep it only if unknown.
-    if not mic and isinstance(market, str):
-        # if we only get a URL, we accept it (RH is inconsistent). Most U.S. commons still pass type=='stock'
-        pass
-    elif mic and mic not in allowed_mics:
+    if mic and allowed_mics and mic not in allowed_mics:
         return False
 
-    # Basic symbol checks
-    sym = inst.get("symbol", "")
+    sym = (inst.get("symbol") or "").strip().upper()
     if not sym or not sym.isascii():
         return False
-    s = sym.strip().upper()
-
-    # Filter out obvious non-common patterns:
-    # (We keep class shares like BRK.B, BF.B.)
-    # Skip temporary/test-like tickers
-    if any(x in s for x in ["^", " ", "/"]):
+    if any(x in sym for x in ["^", " ", "/"]):
         return False
-    # Avoid symbols that look like when-issued etc. (rare on RH)
-    if s.endswith(("~", ".WI")):
+    if sym.endswith(("~", ".WI")):
         return False
-
     return True
 
 def write_symbols(symbols: List[str], out_path: str) -> None:
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    symbols = sorted(set(symbols))
-    with open(out_path, "w", encoding="utf-8") as f:
-        for s in symbols:
-            f.write(f"{s}\n")
-    print(f"✅ Wrote {len(symbols)} symbols -> {out_path}")
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    uniq = sorted(set(symbols))
+    path.write_text("\n".join(uniq) + "\n", encoding="utf-8")
+    print(f"✅ Wrote {len(uniq)} symbols -> {path}")
 
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Generate U.S. common stock symbols from Robinhood.")
-    p.add_argument(
-        "--out",
-        default="data/symbols_robinhood.txt",
-        help="Output file path (default: data/symbols_robinhood.txt)",
-    )
-    p.add_argument(
-        "--allow-mics",
-        default=",".join(ALLOWED_US_MICS),
-        help="Comma-separated list of allowed MICs (default: major U.S. lit exchanges).",
-    )
-    p.add_argument(
-        "--include-otc",
-        action="store_true",
-        help="If set, do NOT filter by MICs (OTC may leak in).",
-    )
+    p.add_argument("--out", default="data/symbols_robinhood.txt",
+                   help="Output file (default: data/symbols_robinhood.txt)")
+    p.add_argument("--include-otc", action="store_true",
+                   help="If set, skip MIC filtering (OTC may appear).")
     args = p.parse_args(argv)
 
-    allowed_mics = set(args.allow_mics.split(",")) if not args.include_otc else set()
+    allowed_mics = set() if args.include_otc else ALLOWED_US_MICS
 
     sess = requests.Session()
-    symbols: List[str] = []
-    count = 0
-
+    syms: List[str] = []
+    total = 0
     print("🔎 Fetching instruments from Robinhood…")
     for inst in fetch_instruments(sess):
-        count += 1
+        total += 1
         if instrument_is_us_common(inst, allowed_mics):
-            symbols.append(inst["symbol"].strip().upper())
-
-    print(f"Found {len(symbols)} candidate symbols out of {count} instruments.")
-    write_symbols(symbols, args.out)
+            syms.append(inst["symbol"].strip().upper())
+    print(f"Found {len(syms)} candidate symbols out of {total} instruments.")
+    write_symbols(syms, args.out)
     return 0
 
 if __name__ == "__main__":
