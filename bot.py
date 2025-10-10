@@ -13,13 +13,13 @@ from ta.momentum import RSIIndicator
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Local modules
-from scanner_core import run_scan            # your existing multi-ticker scan
-import history                                # new sqlite helper
+from scanner_core import run_scan            # your existing multi-ticker scan (already in repo)
+import history                                # our tiny SQLite helper
 
-TOKEN   = os.environ.get("DISCORD_TOKEN")
-GUILD_ID = os.environ.get("GUILD_ID")  # optional for instant slash sync
+TOKEN    = os.environ.get("DISCORD_TOKEN")
+GUILD_ID = os.environ.get("GUILD_ID")  # optional for instant slash sync (your server's 18-digit ID)
 
-# === Universe for /earnings_watch (+/- 7d) ===
+# Universe for /earnings_watch (±7 days)
 DEFAULT_UNIVERSE = [
     "SPY","QQQ","AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","NFLX","AMD",
     "BA","COST","WMT","ORCL","KO","PEP","CRM","SHOP","MS","JPM","PYPL","DIS","INTC","UNH","T"
@@ -36,80 +36,13 @@ def fmt_usd(x) -> str:
         return str(x)
 
 def nearest_strike(series, spot):
-    # Return row index with strike closest to spot
     diffs = (series.astype(float) - float(spot)).abs()
     return int(diffs.sort_values().index[0])
 
 async def to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
 
-# ---------- single-ticker analysis ----------
-def analyze_symbol(symbol: str):
-    """
-    Returns dict with price, bias, buy_range, target, stop, indicators, and an option suggestion.
-    Uses ~5d/5m data to mirror your scanner style.
-    """
-    try:
-        d = yf.download(symbol, period="5d", interval="5m", auto_adjust=True, progress=False)
-        if d.empty:
-            return {"ok": False, "error": "No data."}
-
-        close = d["Close"].iloc[-1]
-        vol   = d["Volume"].tail(20).mean()
-
-        ema20 = EMAIndicator(d["Close"], window=20).ema_indicator()
-        ema50 = EMAIndicator(d["Close"], window=50).ema_indicator()
-        rsi   = RSIIndicator(d["Close"], window=14).rsi()
-        macd  = MACD(d["Close"]).macd()
-        macd_sig = MACD(d["Close"]).macd_signal()
-        macd_diff = macd - macd_sig
-
-        # Trend/momentum heuristics (align with your scanner spirit)
-        uptrend   = (d["Close"].iloc[-1] > ema20.iloc[-1] > ema50.iloc[-1]) and macd_diff.iloc[-1] > 0
-        downtrend = (d["Close"].iloc[-1] < ema20.iloc[-1] < ema50.iloc[-1]) and macd_diff.iloc[-1] < 0
-
-        if uptrend:
-            bias = "CALL"
-        elif downtrend:
-            bias = "PUT"
-        else:
-            # fallback on RSI + MACD
-            bias = "CALL" if (macd_diff.iloc[-1] > 0 and rsi.iloc[-1] >= 50) else "PUT"
-
-        # Simple trade plan bands (~0.20% scalp style)
-        pct = 0.002
-        if bias == "CALL":
-            buy_low, buy_high = close * (1 - pct), close * (1 - pct/2)
-            target = close * (1 + 0.003)
-            stop   = close * (1 - 0.003)
-        else:
-            buy_low, buy_high = close * (1 + pct/2), close * (1 + pct)
-            target = close * (1 - 0.003)
-            stop   = close * (1 + 0.003)
-
-        reasons = []
-        reasons.append(f"Trend: {'Up' if uptrend else ('Down' if downtrend else 'Mixed')} (Close {fmt_usd(close)} vs EMA20/EMA50)")
-        reasons.append(f"MACD diff: {macd_diff.iloc[-1]:.3f} | RSI: {rsi.iloc[-1]:.1f}")
-        if vol > d["Volume"].mean():
-            reasons.append("Moderate volume")
-
-        # Option suggestion: pick weekly with 7–21 DTE if possible, else nearest
-        opt = pick_option(symbol, close, bias)
-
-        return {
-            "ok": True,
-            "symbol": symbol.upper(),
-            "price": float(close),
-            "bias": bias,
-            "buy_range": f"{fmt_usd(buy_low)}–{fmt_usd(buy_high)}",
-            "target": fmt_usd(target),
-            "stop": fmt_usd(stop),
-            "why": "; ".join(reasons),
-            "option": opt
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
+# ---------- options picker ----------
 def pick_option(symbol: str, spot: float, bias: str):
     """
     Choose an expiry ~7–21 DTE if available, ATM strike, compute mid & spread.
@@ -121,24 +54,27 @@ def pick_option(symbol: str, spot: float, bias: str):
             return {"note": "No options listed."}
 
         today = dt.datetime.utcnow().date()
-        # find expiry with 7 <= DTE <= 21, else nearest
+
         def dte(e):
             ed = dt.datetime.strptime(e, "%Y-%m-%d").date()
             return (ed - today).days
+
+        # Prefer around 10 DTE; if none, pick nearest
         sorted_exps = sorted(expiries, key=lambda e: abs(max(dte(e), 0) - 10))
         expiry = sorted_exps[0]
 
         chain = t.option_chain(expiry)
-        tbl = chain.calls if bias == "CALL" else chain.puts
+        tbl = chain.calls if bias.upper() == "CALL" else chain.puts
         if tbl.empty:
             return {"note": f"No {bias.lower()} chain for {expiry}."}
 
-        # nearest strike to spot
         idx = nearest_strike(tbl["strike"], spot)
         row = tbl.loc[idx]
+
         bid = float(row.get("bid", np.nan) or 0)
         ask = float(row.get("ask", np.nan) or 0)
-        mid = (bid + ask) / 2 if (bid and ask) else float(row.get("lastPrice", np.nan) or 0)
+        last = float(row.get("lastPrice", np.nan) or 0)
+        mid = (bid + ask) / 2 if (bid and ask) else (last or None)
         spread_pct = round(((ask - bid) / mid * 100), 1) if (mid and bid and ask and mid > 0) else None
 
         return {
@@ -178,7 +114,7 @@ def news_sentiment(symbol: str, limit=5):
     avg = round(sum(s for _,_,s in scored)/len(scored), 3)
     return {"avg": avg, "items": scored}
 
-# ---------- earnings watch (+/- 7d) ----------
+# ---------- earnings watch (±7 days) ----------
 def earnings_within_7d(symbol: str):
     """
     Returns list of (date, days_from_now) within +/- 7 days, else [].
@@ -188,7 +124,6 @@ def earnings_within_7d(symbol: str):
         df = t.get_earnings_dates(limit=6)
         if df is None or df.empty:
             return []
-        # Index is DatetimeIndex named 'Earnings Date' in yfinance>=0.2.66
         dates = list(df.index.to_pydatetime())
         now = dt.datetime.utcnow()
         hits = []
@@ -199,6 +134,110 @@ def earnings_within_7d(symbol: str):
         return hits
     except Exception:
         return []
+
+# ---------- single-ticker analysis (fixed: always 1-D) ----------
+def analyze_symbol(symbol: str):
+    """
+    Returns dict with price, bias, buy_range, target, stop, indicators, and an option suggestion.
+    Uses ~5d/5m data. Robust to MultiIndex/2D columns from yfinance.
+    """
+    try:
+        d = yf.download(symbol, period="5d", interval="5m", auto_adjust=True, progress=False)
+        if d is None or len(d) == 0:
+            return {"ok": False, "error": "No data."}
+
+        # --- normalize columns to 1-D Series ---
+        def to_1d_series(obj, name: str):
+            """
+            Ensures a pandas Series (1-D). Handles DataFrame (n,1), MultiIndex, or numpy arrays.
+            """
+            if obj is None:
+                raise ValueError(f"{name} missing")
+            if isinstance(obj, pd.DataFrame):
+                # if single column DF, take the first column
+                if obj.shape[1] >= 1:
+                    ser = obj.iloc[:, 0]
+                else:
+                    raise ValueError(f"{name} DataFrame has no columns")
+            elif isinstance(obj, pd.Series):
+                ser = obj
+            else:
+                # numpy array or other: flatten into Series, try to use d.index for alignment
+                arr = np.asarray(obj).reshape(-1)
+                ser = pd.Series(arr, index=d.index[:len(arr)], name=name)
+            return pd.to_numeric(ser, errors="coerce")
+
+        # Support both normal and MultiIndex (('NVDA','Close')) shapes
+        if isinstance(d.columns, pd.MultiIndex):
+            close_raw  = d.xs("Close",  axis=1, level=-1, drop_level=False)
+            volume_raw = d.xs("Volume", axis=1, level=-1, drop_level=False)
+        else:
+            close_raw  = d.get("Close")
+            volume_raw = d.get("Volume")
+
+        close  = to_1d_series(close_raw,  "Close")
+        volume = to_1d_series(volume_raw, "Volume")
+
+        # Drop NaNs
+        mask = close.notna()
+        close = close[mask]
+        volume = volume[mask]
+        if len(close) < 60:
+            return {"ok": False, "error": "Not enough recent data for indicators."}
+
+        last_close = float(close.iloc[-1])
+        avg_vol20  = float(volume.tail(20).mean()) if volume.notna().any() else np.nan
+
+        ema20 = EMAIndicator(close, window=20).ema_indicator()
+        ema50 = EMAIndicator(close, window=50).ema_indicator()
+        rsi   = RSIIndicator(close, window=14).rsi()
+        macd_obj = MACD(close)
+        macd      = macd_obj.macd()
+        macd_sig  = macd_obj.macd_signal()
+        macd_diff = macd - macd_sig
+
+        uptrend   = (last_close > float(ema20.iloc[-1]) > float(ema50.iloc[-1])) and float(macd_diff.iloc[-1]) > 0
+        downtrend = (last_close < float(ema20.iloc[-1]) < float(ema50.iloc[-1])) and float(macd_diff.iloc[-1]) < 0
+
+        if uptrend:
+            bias = "CALL"
+        elif downtrend:
+            bias = "PUT"
+        else:
+            bias = "CALL" if (float(macd_diff.iloc[-1]) > 0 and float(rsi.iloc[-1]) >= 50) else "PUT"
+
+        # Simple trade plan (~0.20% bands)
+        pct = 0.002
+        if bias == "CALL":
+            buy_low, buy_high = last_close * (1 - pct), last_close * (1 - pct/2)
+            target = last_close * (1 + 0.003)
+            stop   = last_close * (1 - 0.003)
+        else:
+            buy_low, buy_high = last_close * (1 + pct/2), last_close * (1 + pct)
+            target = last_close * (1 - 0.003)
+            stop   = last_close * (1 + 0.003)
+
+        reasons = []
+        reasons.append(f"Trend: {'Up' if uptrend else ('Down' if downtrend else 'Mixed')} (Close {fmt_usd(last_close)} vs EMA20/EMA50)")
+        reasons.append(f"MACD diff: {float(macd_diff.iloc[-1]):.3f} | RSI: {float(rsi.iloc[-1]):.1f}")
+        if not np.isnan(avg_vol20) and float(volume.iloc[-1]) > avg_vol20:
+            reasons.append("Moderate volume")
+
+        opt = pick_option(symbol, last_close, bias)
+
+        return {
+            "ok": True,
+            "symbol": symbol.upper(),
+            "price": float(last_close),
+            "bias": bias,
+            "buy_range": f"{fmt_usd(buy_low)}–{fmt_usd(buy_high)}",
+            "target": fmt_usd(target),
+            "stop": fmt_usd(stop),
+            "why": "; ".join(reasons),
+            "option": opt
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # ---------- Discord client ----------
 class ScannerBot(discord.Client):
@@ -224,7 +263,7 @@ client = ScannerBot()
 async def on_ready():
     print(f"✅ Logged in as {client.user} (latency {client.latency*1000:.0f} ms)")
 
-# ---- simple health ----
+# ---- health ----
 @client.tree.command(name="ping", description="Check if the bot is alive.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("🏓 pong", ephemeral=True)
@@ -245,14 +284,14 @@ async def help_cmd(interaction: discord.Interaction):
             "• **Bias**: CALL (green) or PUT (red) from trend+momentum\n"
             "• **Buy Range**: zone to enter\n"
             "• **Target/Stop**: exit planning\n"
-            "• **Option**: nearest ~7–21 DTE, ATM, mid & spread %\n"
+            "• **Option**: ~7–21 DTE, ATM, mid & spread %\n"
             "• **Risk**: from scanner heuristics (liquidity/volatility)\n"
         ),
         color=0x5865F2
     )
     await interaction.response.send_message(embed=e, ephemeral=True)
 
-# ---- SCAN NOW (existing, robust) ----
+# ---- SCAN NOW (uses your scanner_core.run_scan) ----
 @client.tree.command(name="scan_now", description="Run the options scanner and post top picks.")
 async def scan_now(interaction: discord.Interaction):
     deferred = False
@@ -340,7 +379,7 @@ async def scan_ticker(interaction: discord.Interaction, symbol: str):
         description=(f"**Bias:** {res['bias']}  •  **Buy:** {res['buy_range']}  •  "
                      f"**Target:** {res['target']}  •  **Stop:** {res['stop']}\n"
                      f"**Why:** {res['why']}"),
-        color=color_for(res["bias"])
+        color=color_for(res['bias'])
     )
     opt = res.get("option", {}) or {}
     if opt.get("contract"):
@@ -371,7 +410,7 @@ async def scan_ticker(interaction: discord.Interaction, symbol: str):
     except Exception:
         traceback.print_exc()
 
-# ---- EARNINGS WATCH (+/- 7 days) ----
+# ---- EARNINGS WATCH (±7 days) ----
 @client.tree.command(name="earnings_watch", description="Show universe with earnings within ±7 days")
 async def earnings_watch(interaction: discord.Interaction):
     try:
@@ -389,8 +428,7 @@ async def earnings_watch(interaction: discord.Interaction):
         await interaction.followup.send("No earnings within ±7 days for the current universe.")
         return
 
-    # sort by absolute days from now
-    rows.sort(key=lambda x: abs(x[2]))
+    rows.sort(key=lambda x: abs(x[2]))  # closest first
     desc = []
     for tkr, when, diff in rows[:20]:
         tag = "🟢 in" if diff >= 0 else "🔴 was"
@@ -428,7 +466,7 @@ async def news_sentiment_cmd(interaction: discord.Interaction, symbol: str):
 # ---- SIGNAL HISTORY ----
 @client.tree.command(name="signal_history", description="Show last 3 signals we posted for this ticker")
 @app_commands.describe(symbol="Ticker symbol, e.g., AAPL")
-async def signal_history(interaction: discord.Interaction, symbol: str):
+async def signal_history_cmd(interaction: discord.Interaction, symbol: str):
     rows = history.recent_for_ticker(symbol.upper(), limit=3)
     if not rows:
         await interaction.response.send_message(f"No history found for **{symbol.upper()}** yet.", ephemeral=True)
@@ -451,5 +489,8 @@ async def signal_history(interaction: discord.Interaction, symbol: str):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN env var to your Bot Token.")
+    # Optional: print to confirm guild targeting
+    if GUILD_ID:
+        print(f"🔧 GUILD_ID set: {GUILD_ID} (commands sync instantly to that server)")
+    history.init_db()
     client.run(TOKEN)
-
