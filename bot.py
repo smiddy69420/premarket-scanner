@@ -1,225 +1,248 @@
-# bot.py — Premarket Scanner (discord.py 2.x)
+# bot.py
 import os
-import json
-import time
-import logging
+import sys
 import asyncio
-import pathlib
-import argparse
-import urllib.request
 import datetime as dt
+import logging
+from typing import Iterable, List, Optional, Tuple, Union
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 
-import scanner as sc  # local module
-
-# ---------------- Env & logging ----------------
-CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/premarket_cache")
+# ---- Logging ---------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-KEEP_ALIVE = os.getenv("KEEP_ALIVE", "false").lower() == "true"
-
-DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_GUILD_ID    = os.getenv("DISCORD_GUILD_ID")  # optional (guild-scoped sync)
-DISCORD_CHANNEL_ID  = os.getenv("DISCORD_CHANNEL_ID")  # used by cron
-
-if not DISCORD_BOT_TOKEN:
-    raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
-
-numeric_level = getattr(logging, LOG_LEVEL, logging.INFO)
-logging.basicConfig(level=numeric_level,
-                    format="[%(asctime)s] [%(levelname)8s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="[{asctime}] [{levelname:^8}] {name}: {message}",
+    style="{",
+)
 log = logging.getLogger("bot")
 
-pathlib.Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-log.info(f"CACHE_DIR={CACHE_DIR} | LOG_LEVEL={LOG_LEVEL} | KEEP_ALIVE={KEEP_ALIVE}")
+# ---- Environment -----------------------------------------------------------
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
 
-# Bump this whenever command signatures/descriptions change
-COMMAND_VERSION = "v10"
+GUILD_ID = os.getenv("DISCORD_GUILD_ID") or os.getenv("GUILD_ID")
+GUILD = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 
-# ---------------- Small helpers ----------------
-async def run_io(fn, *args, **kwargs):
-    return await asyncio.to_thread(fn, *args, **kwargs)
+CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+SCAN_UNIVERSE = os.getenv(
+    "SCAN_UNIVERSE",
+    "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"
+)
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "true").lower() in ("1", "true", "yes")
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/premarket_cache")
 
-async def _heartbeat_task():
-    hb = logging.getLogger("heartbeat")
-    while True:
-        await asyncio.sleep(60)
-        hb.debug("tick")
+# ---- Intents / Client ------------------------------------------------------
+intents = discord.Intents.none()
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-# ---------------- Discord bootstrap ----------------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+# ---- scanner module (local code) ------------------------------------------
+# We don’t assume exact function names; code is defensive.
+import importlib
 
-_guilds = []
-if DISCORD_GUILD_ID:
+try:
+    scanner = importlib.import_module("scanner")
+except Exception as e:
+    log.exception("Failed to import scanner.py: %s", e)
+    raise
+
+def _parse_universe(env_val: str) -> List[str]:
+    return [s.strip().upper() for s in env_val.split(",") if s.strip()]
+
+# --- helpers to present results --------------------------------------------
+async def _safe_followup_embed(
+    interaction: discord.Interaction,
+    embed: Optional[discord.Embed],
+    files: Optional[List[discord.File]] = None,
+) -> None:
     try:
-        _guilds = [discord.Object(id=int(DISCORD_GUILD_ID))]
+        if embed is None:
+            await interaction.followup.send("No data.", ephemeral=True)
+            return
+        if files:
+            await interaction.followup.send(embed=embed, files=files)
+        else:
+            await interaction.followup.send(embed=embed)
     except Exception:
-        log.warning("DISCORD_GUILD_ID is not a valid int; falling back to global sync.")
+        log.exception("Failed sending embed")
 
-async def _background_refresh_earnings():
-    rlog = logging.getLogger("refresh")
-    try:
-        rlog.info("Refreshing earnings cache…")
-        await run_io(sc.refresh_all_caches)
-        rlog.info("Earnings cache refresh complete.")
-    except Exception:
-        rlog.exception("Earnings cache refresh failed")
+# Some scanners return just an Embed; some return (Embed, [Files]).
+def _coerce_result(
+    res: Union[discord.Embed, Tuple[discord.Embed, List[discord.File]], None]
+) -> Tuple[Optional[discord.Embed], Optional[List[discord.File]]]:
+    if res is None:
+        return None, None
+    if isinstance(res, tuple) and len(res) == 2:
+        return res[0], res[1]
+    if isinstance(res, discord.Embed):
+        return res, None
+    return None, None
 
-async def force_sync_commands(source: str = "auto"):
-    """Hard resync AND print the command list so we can see what Discord has."""
-    # Doing two passes helps bust stale schema on Discord’s side.
-    if _guilds:
-        g = _guilds[0]
-        cmds1 = await tree.sync(guild=g)
-        cmds2 = await tree.sync(guild=g)
-        names = ", ".join(sorted(c.name for c in cmds2))
-        log.info(f"Slash commands synced to guild {g.id} ({len(cmds2)} cmds, {COMMAND_VERSION}) via {source}: {names}")
-    else:
-        cmds1 = await tree.sync()
-        cmds2 = await tree.sync()
-        names = ", ".join(sorted(c.name for c in cmds2))
-        log.info(f"Slash commands synced globally ({len(cmds2)} cmds, {COMMAND_VERSION}) via {source}: {names}")
-
-@bot.event
+# ---- Lifecyle --------------------------------------------------------------
+@client.event
 async def on_ready():
-    await force_sync_commands(source="on_ready")
-    if KEEP_ALIVE:
-        asyncio.create_task(_heartbeat_task())
-    asyncio.create_task(_background_refresh_earnings())
-    log.info(f"Logged in as {bot.user} (id={bot.user.id})")
-
-# ---------------- REST poster for cron ----------------
-DISCORD_API_BASE = "https://discord.com/api/v10"
-
-def _post_message_rest(channel_id: str, content: str) -> None:
-    url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps({"content": content}).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-            "Content-Type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30):
-        pass
-
-def _cron_morning_digest() -> None:
+    log.info("Running in BOT mode (gateway).")
     try:
-        utc_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-        _post_message_rest(DISCORD_CHANNEL_ID, f"🤖 Cron heartbeat OK • {utc_now}")
-    except Exception as e:
-        logging.getLogger("cron").exception("Cron failed: %s", e)
-        _post_message_rest(DISCORD_CHANNEL_ID, f"⚠️ Cron failed: {e}")
+        if GUILD:
+            await tree.sync(guild=GUILD)
+            log.info(
+                "Slash commands synced to guild %s",
+                GUILD.id,
+            )
+        else:
+            await tree.sync()
+            log.info("Slash commands synced globally")
+    except Exception:
+        log.exception("Initial sync failed")
 
-# ---------------- Slash commands ----------------
-@tree.command(name="ping", description=f"Check bot responsiveness • {COMMAND_VERSION}")
-@app_commands.guilds(*_guilds)
+    # optional heartbeat just to see liveness
+    if KEEP_ALIVE:
+        async def _heartbeat():
+            while True:
+                log.debug("heartbeat: tick")
+                await asyncio.sleep(60)
+        client.loop.create_task(_heartbeat())
+
+# ---- Commands --------------------------------------------------------------
+@tree.command(name="ping", description="Health check.", guild=GUILD)
 async def ping_cmd(interaction: discord.Interaction):
     await interaction.response.send_message("📍 Pong", ephemeral=True)
 
-# admin-only sync (so you can force it from Discord if a command is missing)
-@tree.command(name="sync", description=f"(Admin) Force resync of slash commands • {COMMAND_VERSION}")
-@app_commands.guilds(*_guilds)
+@tree.command(name="sync", description="Force re-sync slash commands (admin).", guild=GUILD)
 async def sync_cmd(interaction: discord.Interaction):
-    # Require the user to have Administrator in the guild
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("You need **Administrator** to run `/sync`.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    await force_sync_commands(source=f"manual by {interaction.user}")
-    await interaction.followup.send("✅ Synced. If a command just changed, it should appear now.", ephemeral=True)
-
-# ---- /scan_ticker ----
-@app_commands.guilds(*_guilds)
-@tree.command(name="scan_ticker", description=f"Analyze one ticker (e.g. NVDA) • {COMMAND_VERSION}")
-@app_commands.describe(ticker="Ticker symbol (e.g. NVDA)")
-async def scan_ticker_cmd(interaction: discord.Interaction, ticker: str):
-    symbol = (ticker or "").strip().upper()
-    slog = logging.getLogger("cmd.scan_ticker")
+    # Basic guard: restrict to server owner if available
     try:
-        if not symbol:
-            await interaction.response.send_message("Please provide a ticker, e.g. `NVDA`.", ephemeral=True)
+        if interaction.user and interaction.guild and interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("Not allowed.", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
-        card = await run_io(sc.analyze_one_ticker, symbol)
-        if not card:
-            await interaction.followup.send(f"❌ Could not analyze **{symbol}** (no data).", ephemeral=True)
-            return
-        embed = sc.render_ticker_embed(card)
-        await interaction.followup.send(embed=embed)
-    except asyncio.TimeoutError:
-        slog.error("timeout for %s", symbol)
-        await interaction.followup.send("⏱️ Scan timed out. Try again shortly.", ephemeral=True)
     except Exception:
-        slog.exception("failed for %s", symbol)
-        await interaction.followup.send("❌ Sorry, that failed unexpectedly. Check logs.", ephemeral=True)
+        pass
 
-# ---- /scan (alias) ----
-@app_commands.guilds(*_guilds)
-@tree.command(name="scan", description=f"Analyze one ticker (alias of /scan_ticker) • {COMMAND_VERSION}")
-@app_commands.describe(ticker="Ticker symbol (e.g. NVDA)")
-async def scan_alias_cmd(interaction: discord.Interaction, ticker: str):
-    await scan_ticker_cmd.callback(interaction, ticker)
-
-# ---- /earnings_watch (broad universe) ----
-@app_commands.guilds(*_guilds)
-@tree.command(name="earnings_watch",
-              description=f"Show all tickers with earnings within ±N days (broad universe) • {COMMAND_VERSION}")
-@app_commands.describe(days="Number of days ahead/back to search (1–30)")
-async def earnings_watch_cmd(interaction: discord.Interaction, days: int = 7):
-    elog = logging.getLogger("cmd.earnings")
-    if days < 1 or days > 30:
-        await interaction.response.send_message("Please pick **1–30** days.", ephemeral=True)
-        return
-
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        rows = await run_io(sc.earnings_universe_window, days)
-        if not rows:
-            await interaction.followup.send(f"No earnings within ±{days} days.", ephemeral=True)
+        if GUILD:
+            cmds = await tree.sync(guild=GUILD)
+            names = ", ".join(sorted(c.name for c in cmds))
+            await interaction.followup.send(f"Synced. If a command just changed, it should appear now.\n`{names}`")
+            log.info("Slash commands synced to guild %s via manual by %s: %s",
+                     GUILD.id, interaction.user, names)
+        else:
+            cmds = await tree.sync()
+            names = ", ".join(sorted(c.name for c in cmds))
+            await interaction.followup.send(f"Synced globally.\n`{names}`")
+    except Exception:
+        log.exception("Manual sync failed")
+        await interaction.followup.send("Sync failed. Check logs.", ephemeral=True)
+
+@tree.command(name="scan_ticker", description="Run the multi-signal scan for a single ticker.", guild=GUILD)
+@app_commands.describe(symbol="Ticker symbol, e.g. NVDA")
+async def scan_ticker_cmd(interaction: discord.Interaction, symbol: str):
+    sym = symbol.upper().strip()
+    await interaction.response.defer()  # public by default
+    try:
+        if hasattr(scanner, "analyze_ticker"):
+            res = await scanner.analyze_ticker(sym) if asyncio.iscoroutinefunction(scanner.analyze_ticker) else scanner.analyze_ticker(sym)
+            embed, files = _coerce_result(res)
+            await _safe_followup_embed(interaction, embed, files)
+        else:
+            await interaction.followup.send(f"Scanner missing analyze_ticker() for `{sym}`.", ephemeral=True)
+    except Exception:
+        log.exception("scan_ticker failed for %s", sym)
+        await interaction.followup.send("Sorry, that failed unexpectedly. Check logs.", ephemeral=True)
+
+@tree.command(name="earnings_watch", description="Show tickers with earnings within ±N days across the broad universe.", guild=GUILD)
+@app_commands.describe(days="Window in days (±N). Default 30.")
+async def earnings_watch_cmd(interaction: discord.Interaction, days: Optional[int] = 30):
+    days = int(days or 30)
+    await interaction.response.defer()
+    try:
+        # Preferred new API
+        if hasattr(scanner, "earnings_universe_window"):
+            info = await scanner.earnings_universe_window(days) if asyncio.iscoroutinefunction(scanner.earnings_universe_window) else scanner.earnings_universe_window(days)
+            # Expect either (embed, files) or list of embeds
+            if isinstance(info, list):
+                if not info:
+                    await interaction.followup.send(f"No earnings within ±{days} days.")
+                    return
+                for emb in info[:10]:
+                    await interaction.followup.send(embed=emb)
+                return
+            embed, files = _coerce_result(info)
+            if embed:
+                await _safe_followup_embed(interaction, embed, files)
+                return
+
+        # Back-compat: if a simple helper exists
+        if hasattr(scanner, "earnings_watch_simple"):
+            emb = scanner.earnings_watch_simple(days)
+            await _safe_followup_embed(interaction, emb, None)
             return
 
-        # paginate results nicely
-        page_size = 20
-        total = len(rows)
-        pages = [(i, rows[i:i + page_size]) for i in range(0, total, page_size)]
-        embeds = []
-        page_num = 1
-        total_pages = len(pages)
-        for _, chunk in pages:
-            embeds.append(sc.render_earnings_page_embed(chunk, days, page_num, total_pages))
-            page_num += 1
-
-        while embeds:
-            batch = embeds[:10]
-            embeds = embeds[10:]
-            await interaction.followup.send(embeds=batch)
-
+        await interaction.followup.send(f"No earnings within ±{days} days.", suppress_embeds=True)
     except Exception:
-        elog.exception("Earnings scan failed")
+        log.exception("Earnings watch failed")
         await interaction.followup.send("❌ Earnings scan failed (see logs).", ephemeral=True)
 
-# ---------------- main ----------------
-def main():
-    parser = argparse.ArgumentParser(description="Premarket Scanner bot")
-    parser.add_argument("--mode", choices=["bot", "cron"], default="bot")
-    args = parser.parse_args()
+@tree.command(name="scan", description="Run a ranked scan for the configured universe (ad-hoc).", guild=GUILD)
+@app_commands.describe(top_n="How many top picks to post (default 5).")
+async def scan_cmd(interaction: discord.Interaction, top_n: Optional[int] = 5):
+    await interaction.response.defer()
+    universe = _parse_universe(SCAN_UNIVERSE)
+    if not universe:
+        await interaction.followup.send("Universe is empty. Set SCAN_UNIVERSE env var.", ephemeral=True)
+        return
 
-    if args.mode == "cron":
-        log.info("Running in CRON mode (no gateway).")
-        if not DISCORD_CHANNEL_ID:
-            raise RuntimeError("CRON mode requires DISCORD_CHANNEL_ID.")
-        _cron_morning_digest()
-    else:
-        log.info("Running in BOT mode (gateway).")
-        bot.run(DISCORD_BOT_TOKEN)
+    top_n = max(1, min(int(top_n or 5), 20))
+
+    try:
+        # Preferred: if your scanner exposes a ranked universe function
+        if hasattr(scanner, "rank_universe"):
+            result = await scanner.rank_universe(universe, top_n=top_n) \
+                     if asyncio.iscoroutinefunction(scanner.rank_universe) \
+                     else scanner.rank_universe(universe, top_n=top_n)
+            # Accept either a single embed, a tuple, or a list of embeds
+            if isinstance(result, list):
+                if not result:
+                    await interaction.followup.send("No picks.")
+                    return
+                for emb in result[:top_n]:
+                    if isinstance(emb, discord.Embed):
+                        await interaction.followup.send(embed=emb)
+                return
+            emb, files = _coerce_result(result)
+            if emb:
+                await _safe_followup_embed(interaction, emb, files)
+                return
+
+        # Fallback: no ranking helper – analyze each ticker and post sequentially.
+        posted = 0
+        for sym in universe:
+            if hasattr(scanner, "analyze_ticker"):
+                res = await scanner.analyze_ticker(sym) if asyncio.iscoroutinefunction(scanner.analyze_ticker) else scanner.analyze_ticker(sym)
+                emb, files = _coerce_result(res)
+                if emb:
+                    await _safe_followup_embed(interaction, emb, files)
+                    posted += 1
+                    if posted >= top_n:
+                        break
+        if posted == 0:
+            await interaction.followup.send("No results.", ephemeral=True)
+    except Exception:
+        log.exception("scan (ranked) failed")
+        await interaction.followup.send("Sorry, scan failed. Check logs.", ephemeral=True)
+
+# ---- Run -------------------------------------------------------------------
+def _today_utc_date() -> dt.date:
+    # Avoid deprecated utcnow in 3.12+
+    return dt.datetime.now(dt.timezone.utc).date()
 
 if __name__ == "__main__":
-    main()
+    log.info(
+        "CACHE_DIR=%s | LOG_LEVEL=%s | KEEP_ALIVE=%s",
+        CACHE_DIR, LOG_LEVEL, str(KEEP_ALIVE)
+    )
+    # If you ever want a cron/webhook mode from this same file, you could parse args here.
+    client.run(TOKEN)
