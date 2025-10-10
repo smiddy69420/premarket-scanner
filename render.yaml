@@ -1,0 +1,13 @@
+services:
+  - type: worker                # We’re not serving HTTP; it’s a background Discord bot.
+    name: premarket-scanner
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false             # do NOT put the token in the file/repo; set it in Render UI once
+      - key: DISCORD_GUILD_ID
+        value: "1425873583170781324"     # you can hardcode if you like
+      - key: DISCORD_CHANNEL_ID
+        value: "1425873791145480292"
