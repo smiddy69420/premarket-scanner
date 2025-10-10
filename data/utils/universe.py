@@ -10,11 +10,12 @@ DEFAULT_SYMBOLS_FILE = "data/symbols_robinhood.txt"
 
 class UniverseManager:
     """
-    Loads the ticker universe from:
-      1) ALL_TICKERS env (comma-separated), if present
-      2) SYMBOLS_FILE (default data/symbols_robinhood.txt), if exists
-      3) SCAN_UNIVERSE env (comma-separated), as a minimal fallback
-    Also keeps a cached list and auto-reloads if the file changes.
+    Order of precedence:
+      1) ALL_TICKERS env (comma separated) — optional hand override
+      2) SYMBOLS_FILE (default data/symbols_robinhood.txt)
+      3) SCAN_UNIVERSE env (comma separated) — small fallback
+      4) tiny hardcoded fallback
+    Also hot-reloads automatically if the file changes on disk.
     """
 
     def __init__(self) -> None:
@@ -42,12 +43,12 @@ class UniverseManager:
         return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
     def get_universe(self) -> List[str]:
-        # 1) ALL_TICKERS overrides everything
+        # 1) explicit override
         all_env = self._load_from_env("ALL_TICKERS")
         if all_env:
             return all_env
 
-        # 2) file (with mtime watch)
+        # 2) file (+mtime cache)
         p = Path(self._symbols_file)
         if p.exists():
             mtime = p.stat().st_mtime
@@ -58,16 +59,16 @@ class UniverseManager:
             if self._cache:
                 return self._cache
 
-        # 3) fallback to SCAN_UNIVERSE env
+        # 3) env fallback
         minimal = self._load_from_env("SCAN_UNIVERSE")
         if minimal:
             return minimal
 
-        # 4) hard fallback to ultra-small set
+        # 4) hard fallback
         return ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "AMD", "JPM"]
 
     def ensure_file_exists(self) -> None:
-        """If file path is set but missing, try to generate it once."""
+        """Generate the symbols file once if missing (non-fatal on failure)."""
         p = Path(self._symbols_file)
         if p.exists():
             return
@@ -80,7 +81,7 @@ class UniverseManager:
             print(f"[WARN] Could not generate symbols file: {e}")
 
     def weekly_refresh_forever(self) -> None:
-        """Blocking: run generator weekly."""
+        """Blocking loop: regenerate the symbols file weekly."""
         while True:
             try:
                 subprocess.run(
@@ -90,5 +91,4 @@ class UniverseManager:
                 print("[INFO] UniverseManager: symbols refreshed.")
             except Exception as e:
                 print(f"[WARN] UniverseManager: refresh failed: {e}")
-            # sleep 7 days
-            time.sleep(7 * 24 * 3600)
+            time.sleep(7 * 24 * 3600)  # 7 days
