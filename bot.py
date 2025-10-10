@@ -2,178 +2,154 @@
 import os
 import asyncio
 import datetime as dt
-
 import discord
 from discord import app_commands
+from discord.ext import commands
 
-import scanner  # local module
+from scanner import analyze_one, earnings_watch_text
 
-# ----------------------------
-# Env & Client
-# ----------------------------
-BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")  # optional but recommended for fast sync
+DEFAULT_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")  # optional for /scan_now
+
+if not TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN in environment.")
 
-GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or "0")
-CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or "0")
-
 intents = discord.Intents.default()
-intents.message_content = True  # needed for / commands help & debug text
+intents.message_content = True  # for safety if ever needed
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+tree = bot.tree
 
+# ---------- Helpers ----------
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def build_signal_embed(sig: dict) -> discord.Embed:
-    title, body = scanner.signal_to_embed_fields(sig)
-    color = 0x2ecc71 if sig["type"] == "CALL" else 0xe74c3c
-    e = discord.Embed(title=title, description=body, color=color)
-    e.set_footer(text="Premarket Scanner • educational only, not financial advice")
+def make_signal_embed(result: dict) -> discord.Embed:
+    sym = result["symbol"]
+    if not result.get("ok"):
+        e = discord.Embed(
+            title=f"❌ Could not analyze {sym}",
+            description=result.get("error", "Unknown error"),
+            color=discord.Color.red()
+        )
+        e.set_footer(text="Try again in a minute or use a different interval.")
+        return e
+
+    price = result["price"]
+    sig = result["signal"]
+    reasons = result.get("reasons", [])
+
+    color = discord.Color.yellow()
+    if sig == "CALL":
+        color = discord.Color.green()
+    elif sig == "PUT":
+        color = discord.Color.red()
+
+    e = discord.Embed(
+        title=f"{sym} • {sig}",
+        description=f"**Last Price:** ${price:,.2f}",
+        color=color,
+        timestamp=discord.utils.utcnow()
+    )
+    if reasons:
+        e.add_field(name="Why", value="• " + "\n• ".join(reasons), inline=False)
+    e.set_footer(text="Premarket Scanner • TA snapshot (multi-interval fallback)")
     return e
 
 
-async def run_full_scan_to_embeds() -> list[discord.Embed]:
-    universe = scanner.get_universe_from_env()
-    results = scanner.scan_universe_and_rank(universe, top_n=10, period="5d", interval="5m")
-    embeds = []
-    for sig in results:
-        embeds.append(build_signal_embed(sig))
-    return embeds
+async def safe_followup(interaction: discord.Interaction, embed: discord.Embed, ephemeral: bool = False):
+    """
+    Sends a followup safely after we've already deferred.
+    """
+    try:
+        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+    except discord.errors.NotFound:
+        # Interaction expired; try channel fallback if possible
+        if interaction.channel:
+            await interaction.channel.send(embed=embed)
 
 
-# ----------------------------
-# Lifecycle
-# ----------------------------
-@client.event
+# ---------- Events ----------
+
+@bot.event
 async def on_ready():
     try:
         if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
+            guild = discord.Object(id=int(GUILD_ID))
             await tree.sync(guild=guild)
-            print(f"✅ Synced slash commands to guild {GUILD_ID}")
+            print(f"[sync] Commands synced to guild {GUILD_ID}")
         else:
             await tree.sync()
-            print("✅ Synced slash commands globally (can take up to an hour)")
+            print("[sync] Global commands synced")
     except Exception as e:
-        print(f"Sync error: {e}")
+        print(f"[sync error] {e}")
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
 
 
-# ----------------------------
-# Commands
-# ----------------------------
-@tree.command(name="ping", description="Health check")
-async def ping(interaction: discord.Interaction):
-    # No heavy work; we can respond immediately without defer
-    await interaction.response.send_message("🏓 Pong", ephemeral=True)
+# ---------- Commands ----------
+
+@tree.command(name="ping", description="Check if the bot is alive.")
+async def ping_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=False, ephemeral=True)
+    await safe_followup(interaction, discord.Embed(title="🏓 Pong", color=discord.Color.blurple()), ephemeral=True)
 
 
-@tree.command(name="help", description="Show command list and how to read signals")
-async def help_cmd(interaction: discord.Interaction):
+@tree.command(name="scan_ticker", description="Analyze one ticker on demand (e.g., NVDA, TSLA, JPM).")
+@app_commands.describe(symbol="Ticker symbol, e.g., NVDA")
+async def scan_ticker_cmd(interaction: discord.Interaction, symbol: str):
+    await interaction.response.defer(thinking=True, ephemeral=False)
     try:
-        await interaction.response.defer(ephemeral=True)
-
-        e = discord.Embed(
-            title="📘 Premarket Scanner — Help",
-            description=(
-                "**Commands**\n"
-                "• `/ping` — health check\n"
-                "• `/scan_now` — run the premarket scan now\n"
-                "• `/scan_ticker SYMBOL` — analyze one ticker\n"
-                "• `/earnings [SYMBOL]` — earnings window (±7 days) for SYMBOL or your universe\n"
-                "\n"
-                "**Reading Signals**\n"
-                "• **Type**: CALL/PUT\n"
-                "• **Buy/Target/Stop**: suggested intraday plan\n"
-                "• **Risk**: liquidity, spreads, event risk\n"
-                "• **Why**: TA summary (trend, MACD, RSI)\n"
-                "• **Options Block**: contract, mid, spread%, vol, OI\n"
-            ),
-            color=0x2ecc71
+        result = analyze_one(symbol)
+        embed = make_signal_embed(result)
+    except Exception as e:
+        embed = discord.Embed(
+            title=f"❌ Could not analyze {symbol.upper()}",
+            description=str(e),
+            color=discord.Color.red()
         )
-        e.set_footer(text="Tip: try /scan_ticker NVDA")
-        await interaction.followup.send(embed=e, ephemeral=True)
-    except Exception as ex:
-        try:
-            await interaction.followup.send(f"❌ Help failed: {ex}", ephemeral=True)
-        except:
-            pass
+    await safe_followup(interaction, embed, ephemeral=False)
 
 
-@tree.command(name="scan_now", description="Run a fresh premarket scan now and post it")
-async def scan_now(interaction: discord.Interaction):
+@tree.command(name="earnings", description="Show earnings date if within ±7 days.")
+@app_commands.describe(symbol="Ticker symbol, e.g., AAPL")
+async def earnings_cmd(interaction: discord.Interaction, symbol: str):
+    await interaction.response.defer(thinking=True, ephemeral=False)
     try:
-        await interaction.response.defer(ephemeral=False)
-
-        embeds = await run_full_scan_to_embeds()
-        if not embeds:
-            await interaction.followup.send("⚠️ No qualifying signals right now.")
-            return
-
-        # send in chunks of 10
-        batch = []
-        for e in embeds:
-            batch.append(e)
-            if len(batch) == 10:
-                await interaction.followup.send(embeds=batch)
-                batch = []
-        if batch:
-            await interaction.followup.send(embeds=batch)
-    except Exception as ex:
-        msg = f"❌ Scan failed: `{ex}`"
-        try:
-            await interaction.followup.send(msg)
-        except:
-            try:
-                await interaction.channel.send(msg)
-            except:
-                pass
+        msg = earnings_watch_text(symbol, days_window=7)
+        embed = discord.Embed(title="Earnings Watch", description=msg, color=discord.Color.orange())
+    except Exception as e:
+        embed = discord.Embed(title="Earnings Watch", description=f"❌ {e}", color=discord.Color.red())
+    await safe_followup(interaction, embed, ephemeral=False)
 
 
-@tree.command(name="scan_ticker", description="Analyze a single ticker")
-@app_commands.describe(symbol="Ticker symbol (e.g., NVDA, TSLA, RMCF)")
-async def scan_ticker(interaction: discord.Interaction, symbol: str):
-    try:
-        await interaction.response.defer(ephemeral=False)
-
-        sig = scanner.analyze_one_ticker(symbol, period="5d", interval="5m")
-        e = build_signal_embed(sig)
-        await interaction.followup.send(embed=e)
-    except Exception as ex:
-        try:
-            await interaction.followup.send(f"❌ Could not analyze **{symbol.upper()}**: {ex}")
-        except:
-            pass
-
-
-@tree.command(name="earnings", description="Show earnings within ±7 days")
-@app_commands.describe(symbol="Optional ticker; if omitted use your configured universe")
-async def earnings(interaction: discord.Interaction, symbol: str = ""):
-    try:
-        await interaction.response.defer(ephemeral=False)
-
-        if symbol.strip():
-            syms = [symbol.strip().upper()]
-        else:
-            syms = scanner.get_universe_from_env()
-
-        text = scanner.earnings_watch_text(syms, days_window=7)
-        await interaction.followup.send(text)
-    except Exception as ex:
-        try:
-            await interaction.followup.send(f"❌ Earnings watch failed: {ex}")
-        except:
-            pass
+@tree.command(name="help", description="Show available commands and tips.")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=False, ephemeral=True)
+    desc = (
+        "**/ping** — quick connectivity check\n"
+        "**/scan_ticker SYMBOL** — analyze one ticker on demand (e.g., NVDA)\n"
+        "**/earnings SYMBOL** — earnings date if within ±7 days\n"
+        "**/scan_now** — run the full ranked scan (if configured)\n\n"
+        "Tips:\n"
+        "• Results use multiple data fallbacks (1m → 5m → 1h → 1d) to reduce empty-data errors.\n"
+        "• If a symbol is an ETF or has no fundamentals, earnings may be N/A.\n"
+    )
+    e = discord.Embed(title="Premarket Scanner — Help", description=desc, color=discord.Color.blurple())
+    await safe_followup(interaction, e, ephemeral=True)
 
 
-# ----------------------------
-# Entry
-# ----------------------------
-if __name__ == "__main__":
-    # Optional: pin New York timezone so your daily workflow timestamps look right
-    if "TZ" not in os.environ:
-        os.environ["TZ"] = "America/New_York"
-    client.run(BOT_TOKEN)
+# Optional: if you already have a ranked scanner wired up, leave this here.
+@tree.command(name="scan_now", description="Run the full ranked scan and post results.")
+async def scan_now_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True, ephemeral=False)
+    # Placeholder hook: integrate your existing ranked scan dispatcher here if needed.
+    e = discord.Embed(
+        title="Scan Now",
+        description="Your on-demand ranked scan runner is wired in the GitHub workflow. "
+                    "This button will be enabled when that handler is exposed here.",
+        color=discord.Color.greyple()
+    )
+    await safe_followup(interaction, e, ephemeral=False)
+
+
+# ---------- Run ----------
+bot.run(TOKEN)
