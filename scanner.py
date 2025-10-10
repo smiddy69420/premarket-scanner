@@ -10,7 +10,6 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-
 _analyzer = SentimentIntensityAnalyzer()
 
 
@@ -19,9 +18,7 @@ def _get_hist(ticker: str, period: str = "6mo", interval: str = "1d") -> pd.Data
     hist = t.history(period=period, interval=interval, auto_adjust=True)
     if hist is None or hist.empty:
         raise ValueError("no price data")
-    # standardize column names just in case
-    cols = {c.lower(): c for c in hist.columns}
-    if "close" not in [c.lower() for c in hist.columns]:
+    if "Close" not in hist.columns:
         raise ValueError("missing Close column")
     return hist
 
@@ -48,7 +45,7 @@ def _rsi(series: pd.Series, window: int = 14) -> Optional[float]:
 
 
 def _macd_diff(series: pd.Series) -> Optional[float]:
-    if len(series) < 35:  # MACD default windows 12/26/9 → need a little history
+    if len(series) < 35:
         return None
     ind = MACD(close=series)
     return float(ind.macd_diff().iloc[-1])
@@ -78,7 +75,8 @@ def _sentiment_from_news(ticker: str, limit: int = 15) -> float:
         return 0.0
 
 
-def _bias(last: float, ema20: Optional[float], ema50: Optional[float], macd: Optional[float], rsi: Optional[float]) -> str:
+def _bias(last: float, ema20: Optional[float], ema50: Optional[float],
+          macd: Optional[float], rsi: Optional[float]) -> str:
     try:
         above20 = ema20 is not None and last > ema20
         above50 = ema50 is not None and last > ema50
@@ -89,7 +87,6 @@ def _bias(last: float, ema20: Optional[float], ema50: Optional[float], macd: Opt
             return "CALL"
         if below20 and below50 and (macd is None or macd <= 0):
             return "PUT"
-        # fine-tune with RSI
         if rsi is not None:
             if rsi >= 65 and (macd is None or macd >= 0):
                 return "CALL"
@@ -100,8 +97,41 @@ def _bias(last: float, ema20: Optional[float], ema50: Optional[float], macd: Opt
         return "NEUTRAL"
 
 
+def _earnings_date_for(ticker: str) -> Optional[dt.date]:
+    t = yf.Ticker(ticker)
+    today = dt.date.today()
+
+    # 1) get_earnings_dates (preferred)
+    try:
+        df = t.get_earnings_dates(limit=12)
+        if df is not None and not df.empty:
+            dates = [idx.date() for idx in df.index if isinstance(idx, pd.Timestamp)]
+            if dates:
+                dates.sort(key=lambda d: abs(d - today))
+                return dates[0]
+    except Exception:
+        pass
+
+    # 2) calendar (fallback)
+    try:
+        cal = t.calendar
+        if isinstance(cal, pd.DataFrame) and not cal.empty and "Earnings Date" in cal.index:
+            vals = cal.loc["Earnings Date"].dropna().values
+            for v in vals:
+                if isinstance(v, (pd.Timestamp, dt.datetime)):
+                    return v.date()
+                if isinstance(v, str):
+                    try:
+                        return pd.to_datetime(v).date()
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    return None
+
+
 def analyze_one_ticker(ticker: str) -> dict:
-    """Return a dict with all fields used by the bot. Raise ValueError for user-visible issues."""
     if not ticker or not ticker.isalnum():
         raise ValueError("invalid ticker")
 
@@ -109,24 +139,21 @@ def analyze_one_ticker(ticker: str) -> dict:
     close = hist["Close"]
     last = float(close.iloc[-1])
 
-    # Basic stats
     change_1d = _pct_change(close, 1) or 0.0
     change_5d = _pct_change(close, 5) or 0.0
-    change_1m = _pct_change(close, 21) or 0.0  # ~21 trading days
+    change_1m = _pct_change(close, 21) or 0.0
 
     low_52 = float(close.min())
     high_52 = float(close.max())
 
-    # Indicators
     ema20 = _ema(close, 20)
     ema50 = _ema(close, 50)
     rsi = _rsi(close, 14)
     macd = _macd_diff(close)
     vol_ratio = _volume_ratio(hist.get("Volume"), 20)
-
     sentiment = _sentiment_from_news(ticker)
-
     rec = _bias(last, ema20, ema50, macd, rsi)
+    earn = _earnings_date_for(ticker)
 
     return {
         "ticker": ticker.upper(),
@@ -143,51 +170,11 @@ def analyze_one_ticker(ticker: str) -> dict:
         "volume_ratio": vol_ratio,
         "sentiment": round(sentiment, 2),
         "rec": rec,
+        "earnings_date": earn.isoformat() if earn else None,
     }
 
 
-def _earnings_date_for(ticker: str) -> Optional[dt.date]:
-    """Best-effort next/closest earnings date using multiple yfinance sources."""
-    t = yf.Ticker(ticker)
-    today = dt.date.today()
-
-    # 1) get_earnings_dates (newer API)
-    try:
-        df = t.get_earnings_dates(limit=12)
-        if df is not None and not df.empty:
-            # Index is DatetimeIndex of earnings dates
-            dates = [idx.date() for idx in df.index if isinstance(idx, pd.Timestamp)]
-            if dates:
-                # choose the date with minimum absolute distance from today (past or future)
-                dates.sort(key=lambda d: abs(d - today))
-                return dates[0]
-    except Exception:
-        pass
-
-    # 2) calendar (older API)
-    try:
-        cal = t.calendar
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            # Look for 'Earnings Date' row
-            if "Earnings Date" in cal.index:
-                vals = cal.loc["Earnings Date"].dropna().values
-                # sometimes returns array of timestamps/strings
-                for v in vals:
-                    if isinstance(v, (pd.Timestamp, dt.datetime)):
-                        return v.date()
-                    if isinstance(v, str):
-                        try:
-                            return pd.to_datetime(v).date()
-                        except Exception:
-                            continue
-    except Exception:
-        pass
-
-    return None
-
-
 def earnings_within_window(tickers: List[str], days: int = 7) -> List[Tuple[str, dt.date]]:
-    """Return list of (ticker, date) with |date - today| <= days."""
     out: List[Tuple[str, dt.date]] = []
     window = dt.timedelta(days=days)
     today = dt.date.today()
@@ -197,7 +184,6 @@ def earnings_within_window(tickers: List[str], days: int = 7) -> List[Tuple[str,
             if d and abs(d - today) <= window:
                 out.append((tk, d))
         except Exception:
-            # ignore single-symbol failures
             continue
     out.sort(key=lambda x: x[1])
     return out
