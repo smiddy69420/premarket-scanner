@@ -11,5 +11,34 @@ services:
         value: "1425873583170781324"
       - key: DISCORD_CHANNEL_ID
         value: "1425873791145480292"
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: TZ
+        value: "America/New_York"
       - key: SCAN_UNIVERSE
         value: "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"
+      - key: CACHE_DIR
+        value: "/tmp/premarket_cache"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: KEEP_ALIVE
+        value: "true"
+
+  # Future: Scheduled cron worker (no gateway)
+  - type: worker
+    name: premarket-cron
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py --mode=cron
+    plan: starter
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        value: "1425873791145480292"
+      - key: TZ
+        value: "America/New_York"
+      - key: CACHE_DIR
+        value: "/tmp/premarket_cache"
+      - key: LOG_LEVEL
+        value: "INFO"
