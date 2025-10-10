@@ -1,272 +1,361 @@
 # scanner.py
-import math
+import os
 import datetime as dt
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pytz
-import requests
 import yfinance as yf
-
 from ta.trend import EMAIndicator, MACD
 from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
 
-NY = pytz.timezone("America/New_York")
 
-# -------- Helpers
+# ----------------------------
+# Config / Universe helpers
+# ----------------------------
 
-def _now_et() -> dt.datetime:
-    return dt.datetime.now(tz=NY)
+def get_universe_from_env() -> List[str]:
+    """
+    Read a comma-separated universe from env UNIVERSE_CSV, or use a reasonable default.
+    You can set UNIVERSE_CSV in Render like: AAPL,MSFT,AMZN,GOOGL,META,NVDA,TSLA,AMD,BA,KO,PEP,WMT,ORCL,INTC,CRM,UNH,T
+    """
+    csv = os.environ.get("UNIVERSE_CSV", "")
+    if csv.strip():
+        u = [s.strip().upper() for s in csv.split(",") if s.strip()]
+        return sorted(list(dict.fromkeys(u)))
+    # Default large-cap core (stable + liquid)
+    return [
+        "AAPL","MSFT","AMZN","GOOGL","META","NVDA","TSLA","AMD","INTC","AVGO",
+        "KO","PEP","WMT","COST","BA","ORCL","CRM","DIS","NFLX","T","V","MA",
+        "JPM","BAC","XOM","CVX","WFC","HD","LOW","UNH","PFE","MRK","ABBV",
+        "ADBE","SHOP","QCOM","PYPL","CSCO","IBM","NKE","MCD","GE","CAT",
+    ]
 
-def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure single-level columns."""
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join([str(c) for c in col if c != '']).strip('_') for col in df.columns.values]
-    return df
 
-def fetch_bars(symbol: str, period="5d", interval="5m") -> pd.DataFrame:
-    d = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
-    if d is None or d.empty:
-        raise ValueError(f"No data for {symbol}")
-    d = _flatten_cols(d)
-    # Standardize column names to: Open, High, Low, Close, Volume
-    for c in ["Open","High","Low","Close","Volume"]:
-        if c not in d.columns:
-            # try alternative names like "Open_adjclose"
-            match = [x for x in d.columns if x.lower().startswith(c.lower())]
-            if match:
-                d[c] = d[match[0]]
-            else:
-                raise ValueError(f"Missing column {c} for {symbol}")
-    d = d.dropna(subset=["Open","High","Low","Close"])
-    return d
+# ----------------------------
+# Data / Indicators
+# ----------------------------
 
-@dataclass
-class TAResult:
-    symbol: str
-    price: float
-    bias: str            # CALL / PUT / NEUTRAL
-    buy_low: float
-    buy_high: float
-    target: float
-    stop: float
-    reasons: str
-    risk: str
-    score: float
-    rsi: float
-    macd_diff: float
+def fetch_price_history(ticker: str, period: str = "5d", interval: str = "5m") -> Optional[pd.DataFrame]:
+    """
+    Return OHLCV with a clean DatetimeIndex. None if empty.
+    """
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        # Normalize columns (yfinance sometimes gives lowercase)
+        df = df.rename(columns={c: c.title() for c in df.columns})
+        # Ensure expected columns exist
+        for col in ["Open","High","Low","Close","Volume"]:
+            if col not in df.columns:
+                return None
+        # Drop dupes, sort
+        df = df[["Open","High","Low","Close","Volume"]].copy()
+        df = df[~df.index.duplicated(keep="last")]
+        df = df.sort_index()
+        return df
+    except Exception:
+        return None
 
-@dataclass
-class OptionPick:
-    contract: Optional[str]
-    exp: Optional[str]
-    strike: Optional[float]
-    mid: Optional[float]
-    spread_pct: Optional[float]
-    vol: Optional[int]
-    oi: Optional[int]
-    note: Optional[str]
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    close = df["Close"].astype(float)
-    ema20 = EMAIndicator(close, window=20).ema_indicator()
-    ema50 = EMAIndicator(close, window=50).ema_indicator()
-    macd = MACD(close)
-    rsi = RSIIndicator(close, window=14).rsi()
-    atr = AverageTrueRange(high=df["High"], low=df["Low"], close=close, window=14).average_true_range()
-    out = df.copy()
-    out["EMA20"], out["EMA50"] = ema20, ema50
-    out["MACD"], out["MACD_SIG"] = macd.macd(), macd.macd_signal()
-    out["MACD_DIFF"] = out["MACD"] - out["MACD_SIG"]
-    out["RSI"] = rsi
-    out["ATR"] = atr
-    return out.dropna().copy()
+    """
+    Add EMA20, EMA50, RSI, MACD and return same-length dataframe.
+    """
+    close = pd.Series(df["Close"].astype(float), index=df.index)
+    ema20 = EMAIndicator(close=close, window=20, fillna=False).ema_indicator()
+    ema50 = EMAIndicator(close=close, window=50, fillna=False).ema_indicator()
 
-def _risk_from_spread_vol(spread_pct: float, oi: int) -> str:
-    if spread_pct is None or oi is None:
-        return "High"
-    if spread_pct <= 0.05 and oi >= 1000: return "Low"
-    if spread_pct <= 0.10 and oi >= 300: return "Medium"
-    return "High"
+    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9, fillna=False)
+    rsi = RSIIndicator(close=close, window=14, fillna=False).rsi()
 
-def analyze_symbol(symbol: str, period="5d", interval="5m") -> Tuple[TAResult, OptionPick]:
-    df = fetch_bars(symbol, period=period, interval=interval)
+    df = df.copy()
+    df["EMA20"] = ema20
+    df["EMA50"] = ema50
+    df["MACD"] = macd.macd()
+    df["MACD_Signal"] = macd.macd_signal()
+    df["MACD_Hist"] = macd.macd_diff()
+    df["RSI"] = rsi
+    return df
+
+
+# ----------------------------
+# Earnings (± window days)
+# ----------------------------
+
+def get_next_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
+    """
+    Best-effort: yfinance get_earnings_dates can break for some tickers.
+    Return a pandas Timestamp (UTC-naive) or None.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        # yfinance has get_earnings_dates(limit=...) returning a df with index as dates
+        df = t.get_earnings_dates(limit=8)
+        if df is None or df.empty:
+            return None
+        # Choose nearest upcoming (>= today) else most recent
+        today = dt.date.today()
+        dates = [pd.Timestamp(d).date() for d in df.index.to_list()]
+        upcoming = [d for d in dates if d >= today]
+        chosen = (min(upcoming) if upcoming else max(dates))
+        return pd.Timestamp(chosen)
+    except Exception:
+        return None
+
+
+def earnings_watch_text(symbols: List[str], days_window: int = 7) -> str:
+    """
+    Return a friendly text block of tickers with earnings within ±days_window of today.
+    """
+    today = dt.date.today()
+    start = today - dt.timedelta(days=days_window)
+    end = today + dt.timedelta(days=days_window)
+
+    lines = []
+    for sym in symbols:
+        ed = get_next_earnings_date(sym)
+        if ed is None:
+            continue
+        d = ed.date()
+        if start <= d <= end:
+            sign = "🟢 Today" if d == today else ("🔜 Upcoming" if d > today else "🟡 Recent")
+            lines.append(f"• **{sym}** — {d.isoformat()} ({sign})")
+
+    if not lines:
+        return f"No earnings within ±{days_window} days."
+    lines.sort()
+    return "**Earnings (±{0} days)**\n".format(days_window) + "\n".join(lines)
+
+
+# ----------------------------
+# Simple Scorer & Signal Builder
+# ----------------------------
+
+def last_row(df: pd.DataFrame) -> pd.Series:
+    return df.iloc[-1]
+
+def build_signal(ticker: str, df: pd.DataFrame) -> Optional[Dict]:
+    """
+    Build a single signal dict for the latest bar.
+    CALL if Close > EMA20 > EMA50, PUT if Close < EMA20 < EMA50; else None.
+    """
+    try:
+        row = last_row(df)
+        c = float(row["Close"])
+        ema20 = float(row["EMA20"])
+        ema50 = float(row["EMA50"])
+        rsi = float(row["RSI"])
+        macd_hist = float(row["MACD_Hist"])
+
+        # Trend logic
+        if c > ema20 > ema50:
+            bias = "CALL"
+        elif c < ema20 < ema50:
+            bias = "PUT"
+        else:
+            return None
+
+        # Basic score (positive for CALL strength, negative for PUT strength)
+        score = 0.0
+        score += (abs(ema20 - ema50) / max(1e-9, ema50)) * 100
+        score += (macd_hist * 10.0)
+        score += (70 - abs(50 - rsi)) * 0.05  # RSI away from 50 adds a little conviction
+
+        # Lightweight buy/target/stop around the last price
+        # CALL: slightly above; PUT: slightly below
+        if bias == "CALL":
+            buy_low, buy_high = c - 0.10, c - 0.02
+            target = c + 0.40
+            stop = c - 0.25
+        else:
+            buy_low, buy_high = c + 0.02, c + 0.10
+            target = c - 0.40
+            stop = c + 0.25
+
+        # Why string
+        reasons = []
+        if bias == "CALL":
+            reasons.append("Uptrend (Close>EMA20>EMA50)")
+            if macd_hist > 0: reasons.append("MACD momentum up")
+        else:
+            reasons.append("Downtrend (Close<EMA20<EMA50)")
+            if macd_hist < 0: reasons.append("MACD momentum down")
+        reasons.append(f"RSI {rsi:.1f}")
+
+        return {
+            "ticker": ticker,
+            "price": c,
+            "score": round(score, 2),
+            "type": bias,
+            "buy_range": (round(buy_low, 2), round(buy_high, 2)),
+            "target": round(target, 2),
+            "stop": round(stop, 2),
+            "risk": "Medium",
+            "why": "; ".join(reasons),
+            # We keep options info optional; filled by try_fetch_option_block
+        }
+    except Exception:
+        return None
+
+
+def try_fetch_option_block(ticker: str, bias: str) -> Optional[Dict]:
+    """
+    Best-effort: fetch a nearby monthly contract and return a light liquidity/spread summary.
+    If anything fails, return None (don’t crash scans).
+    """
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options
+        if not exps:
+            return None
+
+        # Prefer the 3rd Friday ~monthly if available, else first listed
+        # yfinance gives 'YYYY-MM-DD' strings
+        chosen = None
+        for e in exps:
+            d = pd.Timestamp(e).date()
+            # heuristic: pick the nearest >= 14 days out (gives options some time)
+            if d >= (dt.date.today() + dt.timedelta(days=14)):
+                chosen = e
+                break
+        if chosen is None:
+            chosen = exps[0]
+
+        chain = t.option_chain(chosen)
+        if bias == "CALL":
+            tbl = chain.calls
+        else:
+            tbl = chain.puts
+
+        if tbl is None or tbl.empty:
+            return None
+
+        # Pick strike near the money (median by abs(strike - last_price))
+        last_price = float(t.fast_info["last_price"]) if "last_price" in t.fast_info else None
+        if last_price is None:
+            # fallback to close from history
+            h = fetch_price_history(ticker, period="1d", interval="1m")
+            if h is None or h.empty:
+                return None
+            last_price = float(h["Close"].iloc[-1])
+
+        tbl = tbl.copy()
+        tbl["dist"] = (tbl["strike"] - last_price).abs()
+        near = tbl.sort_values("dist").head(1).squeeze()
+
+        # Compute mid, spread%, Vol, OI
+        bid = float(near.get("bid", np.nan))
+        ask = float(near.get("ask", np.nan))
+        vol = int(near.get("volume", 0)) if not np.isnan(near.get("volume", np.nan)) else 0
+        oi = int(near.get("openInterest", 0)) if not np.isnan(near.get("openInterest", np.nan)) else 0
+        if np.isnan(bid) or np.isnan(ask) or bid <= 0 or ask <= 0:
+            return None
+
+        mid = round((bid + ask) / 2.0, 2)
+        spread_pct = round(((ask - bid) / mid) * 100.0, 1) if mid > 0 else 0.0
+
+        symbol = near.get("contractSymbol")
+        strike = float(near.get("strike", 0.0))
+        return {
+            "expiry": chosen,
+            "contract": symbol,
+            "strike": strike,
+            "mid": mid,
+            "spread_pct": spread_pct,
+            "volume": vol,
+            "oi": oi
+        }
+    except Exception:
+        return None
+
+
+# ----------------------------
+# Public API used by bot.py
+# ----------------------------
+
+def analyze_one_ticker(ticker: str, period: str = "5d", interval: str = "5m") -> Dict:
+    """
+    Analyze a single ticker and return a dict ready to embed.
+    Raises Exception with a helpful message if something blocks analysis.
+    """
+    tk = ticker.upper().strip()
+    df = fetch_price_history(tk, period=period, interval=interval)
+    if df is None or df.empty:
+        raise Exception("No price data returned")
+
     df = compute_indicators(df)
-    last = df.iloc[-1]
-    px = float(last["Close"])
-    ema20, ema50 = float(last["EMA20"]), float(last["EMA50"])
-    macd_diff = float(last["MACD_DIFF"])
-    rsi = float(last["RSI"])
-    atr = float(last["ATR"])
-    # bias
-    bias = "NEUTRAL"
-    if px > ema20 > ema50 and macd_diff > 0 and rsi >= 55:
-        bias = "CALL"
-    elif px < ema20 < ema50 and macd_diff < 0 and rsi <= 45:
-        bias = "PUT"
+    sig = build_signal(tk, df)
+    if not sig:
+        raise Exception("No clear trend signal (not strictly up/down EMA stack)")
 
-    # simple plan using ATR
-    buy_pad = 0.15 * atr if atr > 0 else max(0.001*px, 0.02)
-    tgt_pad = 0.35 * atr if atr > 0 else max(0.002*px, 0.05)
-    stp_pad = 0.25 * atr if atr > 0 else max(0.002*px, 0.05)
+    # Attach earnings note
+    ed = get_next_earnings_date(tk)
+    if ed is not None:
+        # ±7 days flag
+        window = 7
+        d = ed.date()
+        today = dt.date.today()
+        if abs((d - today).days) <= window:
+            sig["risk"] = "High"
+            sig.setdefault("why", "")
+            sig["why"] += f"; Earnings window (±{window}d: {d.isoformat()})"
 
-    if bias == "CALL":
-        buy_low, buy_high = px - buy_pad, px - 0.5*buy_pad
-        target, stop = px + tgt_pad, px - stp_pad
-    elif bias == "PUT":
-        buy_low, buy_high = px + 0.5*buy_pad, px + buy_pad
-        target, stop = px - tgt_pad, px + stp_pad
-    else:
-        buy_low, buy_high = px - 0.25*buy_pad, px + 0.25*buy_pad
-        target, stop = px + tgt_pad, px - stp_pad
+    # Try options block (best-effort)
+    ob = try_fetch_option_block(tk, sig["type"])
+    if ob:
+        sig["options"] = ob
 
-    reasons = []
-    if bias != "NEUTRAL":
-        reasons.append(f"Trend: {('Up' if bias=='CALL' else 'Down')} (Close {px:.2f} vs EMA20/EMA50)")
-    else:
-        reasons.append(f"Trend: Mixed (Close {px:.2f} vs EMA20/EMA50)")
-    reasons.append(f"MACD diff: {macd_diff:+.3f}")
-    reasons.append(f"RSI: {rsi:.1f}")
+    return sig
 
-    score = (1 if bias == "CALL" else -1 if bias == "PUT" else 0) * 6 \
-            + (rsi - 50) / 5.0 + (macd_diff * 10)
 
-    ta = TAResult(
-        symbol=symbol.upper(),
-        price=px,
-        bias=bias,
-        buy_low=float(buy_low),
-        buy_high=float(buy_high),
-        target=float(target),
-        stop=float(stop),
-        reasons="; ".join(reasons),
-        risk="Medium",
-        score=float(score),
-        rsi=rsi,
-        macd_diff=macd_diff
+def scan_universe_and_rank(universe: List[str], top_n: int = 10,
+                           period: str = "5d", interval: str = "5m") -> List[Dict]:
+    """
+    Analyze a list of tickers, keep those with a clear bias, sort by |score| desc, return top_n
+    """
+    results = []
+    for tk in universe:
+        try:
+            info = analyze_one_ticker(tk, period=period, interval=interval)
+            results.append(info)
+        except Exception:
+            continue
+
+    if not results:
+        return []
+    results.sort(key=lambda x: abs(x.get("score", 0.0)), reverse=True)
+    return results[:top_n]
+
+
+def signal_to_embed_fields(sig: Dict) -> Tuple[str, str]:
+    """
+    Return (title, body) for Discord embed.
+    """
+    t = sig["ticker"]
+    c = sig["price"]
+    bias = sig["type"]
+    tgt = sig["target"]
+    stp = sig["stop"]
+    br_lo, br_hi = sig["buy_range"]
+    risk = sig["risk"]
+    why = sig["why"]
+
+    title = f"{t} @ ${c:.2f} → {bias}"
+    body = (
+        f"**Buy Range:** ${br_lo:.2f} – ${br_hi:.2f}\n"
+        f"**Target:** ${tgt:.2f}   |   **Stop:** ${stp:.2f}\n"
+        f"**Risk:** {risk}\n"
+        f"**Why:** {why}\n"
     )
 
-    opt = choose_option(symbol, px, bias)
-    # refine risk with option liquidity if we have it
-    if opt and opt.spread_pct is not None and opt.oi is not None:
-        ta.risk = _risk_from_spread_vol(opt.spread_pct, opt.oi)
-
-    return ta, opt
-
-def _pick_exp(exp_list: List[str], days_min=7, days_max=21) -> Optional[str]:
-    if not exp_list: return None
-    today = _now_et().date()
-    def dte(exp):
-        try: return (dt.datetime.strptime(exp, "%Y-%m-%d").date() - today).days
-        except: return 9999
-    exp_sorted = sorted(exp_list, key=lambda x: abs(max(min(dte(x), days_max), days_min) - dte(x)))
-    # prefer within band, else earliest future
-    for e in exp_sorted:
-        if 0 < dte(e) <= 45:  # cap
-            if days_min <= dte(e) <= days_max:
-                return e
-    # fallback: next available future
-    fut = [e for e in exp_sorted if dte(e) > 0]
-    return fut[0] if fut else exp_sorted[0]
-
-def _nearest(series: pd.Series, value: float) -> float:
-    return float(series.iloc[(series - value).abs().argsort().iloc[0]])
-
-def choose_option(symbol: str, last_px: float, bias: str) -> OptionPick:
-    try:
-        tkr = yf.Ticker(symbol)
-        exps = list(tkr.options)
-        if not exps:
-            return OptionPick(None,None,None,None,None,None,None,"No options listed")
-        exp = _pick_exp(exps, 7, 21) or exps[0]
-        oc = tkr.option_chain(exp)
-        side = oc.calls if bias == "CALL" else oc.puts if bias == "PUT" else oc.calls
-        df = side.copy()
-        if df is None or df.empty:
-            return OptionPick(None, exp, None, None, None, None, None, "Empty option chain")
-        # Ensure needed fields exist
-        for col in ["bid","ask","strike","volume","openInterest","contractSymbol"]:
-            if col not in df.columns: df[col] = np.nan
-        df["mid"] = (df["bid"].fillna(0) + df["ask"].fillna(0)) / 2.0
-        df["spread_pct"] = np.where(df["mid"] > 0, (df["ask"].fillna(0) - df["bid"].fillna(0)) / df["mid"], np.inf)
-
-        # pick nearest ATM with liquidity/spread filters
-        df["dist"] = (df["strike"] - last_px).abs()
-        filtered = df[(df["openInterest"].fillna(0) >= 50) & (df["spread_pct"] <= 0.20)]
-        pick = None
-        if not filtered.empty:
-            pick = filtered.sort_values(by=["dist","spread_pct","openInterest"], ascending=[True, True, False]).iloc[0]
-        else:
-            pick = df.sort_values(by=["dist","spread_pct","openInterest"], ascending=[True, True, False]).iloc[0]
-        return OptionPick(
-            contract=str(pick.get("contractSymbol", "")),
-            exp=exp,
-            strike=float(pick.get("strike", np.nan)),
-            mid=float(pick.get("mid", np.nan)) if np.isfinite(pick.get("mid", np.nan)) else None,
-            spread_pct=float(pick.get("spread_pct", np.nan)) if np.isfinite(pick.get("spread_pct", np.nan)) else None,
-            vol=int(pick.get("volume", 0)) if not pd.isna(pick.get("volume", np.nan)) else 0,
-            oi=int(pick.get("openInterest", 0)) if not pd.isna(pick.get("openInterest", np.nan)) else 0,
-            note=None
+    if "options" in sig:
+        ob = sig["options"]
+        body += (
+            f"\n**Option Block**\n"
+            f"• `{ob['contract']}` (strike {ob['strike']:.1f}, exp {ob['expiry']})\n"
+            f"• Mid ~ ${ob['mid']:.2f}   |   Spread ~ {ob['spread_pct']:.1f}%\n"
+            f"• Vol {ob['volume']}   |   OI {ob['oi']}\n"
         )
-    except Exception as e:
-        return OptionPick(None, None, None, None, None, None, None, f"Option error: {e}")
-
-def scan_many(tickers: List[str], limit: int = 10, period="5d", interval="5m") -> List[Dict]:
-    rows = []
-    for sym in tickers:
-        try:
-            ta, opt = analyze_symbol(sym, period=period, interval=interval)
-            rows.append({
-                "symbol": ta.symbol,
-                "price": ta.price,
-                "score": ta.score,
-                "bias": ta.bias,
-                "buy_low": ta.buy_low,
-                "buy_high": ta.buy_high,
-                "target": ta.target,
-                "stop": ta.stop,
-                "risk": ta.risk,
-                "reasons": ta.reasons,
-                "opt": opt
-            })
-        except Exception as e:
-            rows.append({
-                "symbol": sym.upper(),
-                "error": str(e)
-            })
-    # sort by absolute score (strongest first)
-    ok = [r for r in rows if "score" in r]
-    err = [r for r in rows if "error" in r]
-    ok = sorted(ok, key=lambda r: abs(r["score"]), reverse=True)[:limit]
-    return ok + err
-
-# -------- Earnings (for any symbol)
-
-def _yahoo_calendar_event(symbol: str) -> Optional[dt.datetime]:
-    try:
-        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=calendarEvents"
-        hdrs = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=hdrs, timeout=10)
-        j = r.json()
-        arr = j["quoteSummary"]["result"][0]["calendarEvents"]["earnings"]["earningsDate"]
-        raw = arr[0].get("raw")
-        if raw:
-            return dt.datetime.fromtimestamp(raw, tz=NY).replace(hour=0, minute=0, second=0, microsecond=0)
-    except Exception:
-        pass
-    return None
-
-def earnings_date(symbol: str) -> Optional[dt.datetime]:
-    try:
-        df = yf.Ticker(symbol).get_earnings_dates(limit=8)
-        if df is not None and not df.empty:
-            # take nearest to today
-            dts = [pd.to_datetime(ix).to_pydatetime().astimezone(NY) for ix in df.index]
-            d = min(dts, key=lambda d: abs((d - _now_et()).days))
-            return d.replace(hour=0, minute=0, second=0, microsecond=0)
-    except Exception:
-        pass
-    return _yahoo_calendar_event(symbol)
+    return title, body
