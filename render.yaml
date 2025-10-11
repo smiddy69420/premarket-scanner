@@ -2,43 +2,30 @@ services:
   - type: worker
     name: premarket-scanner
     env: python
+    plan: starter
+    autoDeploy: true
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python src/bot.py
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      - key: LOG_LEVEL
+        value: DEBUG
+      - key: KEEP_ALIVE
+        value: "True"
+      - key: CACHE_DIR
+        value: /tmp/premarket_cache
+      - key: TZ
+        value: America/New_York
       - key: DISCORD_BOT_TOKEN
         sync: false
       - key: DISCORD_GUILD_ID
-        value: "1425873583170781324"
-      - key: DISCORD_CHANNEL_ID
-        value: "1425873791145480292"
-      - key: PYTHON_VERSION
-        value: "3.12.6"
-      - key: TZ
-        value: "America/New_York"
-      - key: SCAN_UNIVERSE
-        value: "AAPL,MSFT,NVDA,TSLA,AMZN,AMD,JPM"
-      - key: CACHE_DIR
-        value: "/tmp/premarket_cache"
-      - key: LOG_LEVEL
-        value: "INFO"
-      - key: KEEP_ALIVE
-        value: "true"
-
-  # Scheduled/webhook worker — no discord.py import, safe on all Python versions
-  - type: worker
-    name: premarket-cron
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python webhook_runner.py
-    plan: starter
-    envVars:
-      - key: DISCORD_WEBHOOK
         sync: false
-      - key: PYTHON_VERSION
-        value: "3.12.6"
-      - key: TZ
-        value: "America/New_York"
-      - key: CACHE_DIR
-        value: "/tmp/premarket_cache"
-      - key: LOG_LEVEL
-        value: "INFO"
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      # Optional: point to the generated universe file (the code auto-creates it)
+      - key: SYMBOLS_FILE
+        value: data/symbols_robinhood.txt
+      # Optional: leave empty unless you want to hard-override the list in ENV
+      - key: ALL_TICKERS
+        value:
