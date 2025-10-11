@@ -23,9 +23,9 @@ services:
         sync: false
       - key: DISCORD_CHANNEL_ID
         sync: false
-      # Optional: point to the generated universe file (the code auto-creates it)
+      # Point the bot at the symbols file we maintain automatically.
       - key: SYMBOLS_FILE
         value: data/symbols_robinhood.txt
-      # Optional: leave empty unless you want to hard-override the list in ENV
+      # Leave ALL_TICKERS empty (UniverseManager will ignore it if you don't set it)
       - key: ALL_TICKERS
         value:
