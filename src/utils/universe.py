@@ -1,104 +1,116 @@
-# src/utils/universe.py
 import os
-import sys
-import time
-import threading
-import subprocess
-from pathlib import Path
-from typing import List, Optional
+import asyncio
+import logging
+from typing import List, Iterable, Optional
 
-BASE_DIR = Path(__file__).resolve().parents[1]   # .../src
-DEFAULT_SYMBOLS_FILE = (BASE_DIR / ".." / "data" / "symbols_robinhood.txt").resolve()
-GEN_SCRIPT = (BASE_DIR / "generate_symbols_file.py").resolve()
+logger = logging.getLogger(__name__)
+
+SYMBOLS_FILE_ENV = "SYMBOLS_FILE"
+ALL_TICKERS_ENV = "ALL_TICKERS"
+SCAN_UNIVERSE_ENV = "SCAN_UNIVERSE"  # optional small default
+
+DEFAULT_UNIVERSE_FALLBACK = ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "AMD", "JPM"]
+
+def _parse_csv_symbols(text: str) -> List[str]:
+    # Accept comma or whitespace separated, normalize and dedupe
+    raw = [s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()]
+    out = []
+    seen = set()
+    for s in raw:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 class UniverseManager:
     """
-    Priority:
-      1) ALL_TICKERS env (comma-separated) — hard override
-      2) SYMBOLS_FILE path (defaults to data/symbols_robinhood.txt)
-      3) SCAN_UNIVERSE env (comma-separated) — minimal fallback
-      4) tiny hard fallback
-    The file is hot-reloaded on mtime change.
+    Priority order:
+      1) SYMBOLS_FILE (data/symbols_robinhood.txt) if present (recommended)
+      2) ALL_TICKERS env (comma separated)
+      3) SCAN_UNIVERSE env (comma separated)
+      4) DEFAULT_UNIVERSE_FALLBACK
     """
+    def __init__(self):
+        self.symbols: List[str] = []
+        self.symbols_file = os.getenv(SYMBOLS_FILE_ENV, "data/symbols_robinhood.txt")
 
-    def __init__(self) -> None:
-        self._symbols_file = Path(os.getenv("SYMBOLS_FILE", str(DEFAULT_SYMBOLS_FILE))).resolve()
-        self._cache: List[str] = []
-        self._mtime: Optional[float] = None
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _load_csv_env(key: str) -> List[str]:
-        raw = os.getenv(key, "")
-        if not raw:
-            return []
-        return [s.strip().upper() for s in raw.split(",") if s.strip()]
-
-    def _load_file(self) -> List[str]:
-        if not self._symbols_file.exists():
-            return []
-        lines = self._symbols_file.read_text(encoding="utf-8").splitlines()
-        out = []
-        for ln in lines:
-            s = ln.strip().upper()
-            if s:
-                out.append(s)
-        return out
-
-    def get_universe(self) -> List[str]:
-        # 1) explicit env override
-        all_env = self._load_csv_env("ALL_TICKERS")
-        if all_env:
-            return all_env
-
-        # 2) file (with hot-reload cache)
-        if self._symbols_file.exists():
-            m = self._symbols_file.stat().st_mtime
-            with self._lock:
-                if self._mtime != m or not self._cache:
-                    self._cache = self._load_file()
-                    self._mtime = m
-            if self._cache:
-                return self._cache
-
-        # 3) minimal env fallback
-        tiny = self._load_csv_env("SCAN_UNIVERSE")
-        if tiny:
-            return tiny
-
-        # 4) hard fallback (never empty)
-        return ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "AMD", "JPM"]
-
-    def ensure_file_exists(self) -> None:
-        """Generate symbols file if missing (best-effort; non-fatal)."""
-        if self._symbols_file.exists():
-            return
+    def _load_from_file(self) -> Optional[List[str]]:
+        path = self.symbols_file
+        if not path or not os.path.exists(path):
+            return None
         try:
-            self._symbols_file.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                [sys.executable, str(GEN_SCRIPT), "--out", str(self._symbols_file)],
-                check=True,
-            )
-            print(f"[INFO] UniverseManager: generated {self._symbols_file}")
-        except Exception as e:
-            print(f"[WARN] UniverseManager: could not generate file: {e}")
+            with open(path, "r", encoding="utf-8") as f:
+                rows = [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
+            # basic symbol hygiene
+            rows = [s for s in rows if s.isascii() and all(c not in s for c in (" ", "/", "^", "."))]
+            rows = sorted(set(rows))
+            return rows
+        except Exception:
+            logger.exception("Failed reading symbols file %s", path)
+            return None
 
-    def refresh_once(self) -> bool:
-        """Regenerate file once; returns True on success."""
-        try:
-            self._symbols_file.parent.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
-                [sys.executable, str(GEN_SCRIPT), "--out", str(self._symbols_file)],
-                check=True,
-            )
-            print("[INFO] UniverseManager: symbols refreshed.")
-            return True
-        except Exception as e:
-            print(f"[WARN] UniverseManager: refresh failed: {e}")
-            return False
+    def _load_from_env(self) -> Optional[List[str]]:
+        all_tickers = os.getenv(ALL_TICKERS_ENV, "").strip()
+        if all_tickers:
+            return sorted(set(_parse_csv_symbols(all_tickers)))
+        scan_universe = os.getenv(SCAN_UNIVERSE_ENV, "").strip()
+        if scan_universe:
+            return sorted(set(_parse_csv_symbols(scan_universe)))
+        return None
 
-    def weekly_refresh_forever(self) -> None:
-        """Blocking loop; run in a worker thread."""
+    async def initialize(self) -> None:
+        # 1) Try file; if missing, generate it.
+        rows = self._load_from_file()
+        if rows is None:
+            try:
+                # create file once
+                from src.generate_symbols_file import main as gen_main  # local import to avoid import cycles
+            except Exception:
+                try:
+                    from ..generate_symbols_file import main as gen_main  # alt path if run as module
+                except Exception:
+                    logger.exception("Could not import generator; falling back to env universe.")
+                    rows = None
+                else:
+                    rows = gen_main(write_file=True)
+            else:
+                rows = gen_main(write_file=True)
+
+        # 2) If still no file-based rows, fall back to env.
+        if not rows:
+            env_rows = self._load_from_env()
+            rows = env_rows if env_rows else DEFAULT_UNIVERSE_FALLBACK
+
+        self.symbols = rows
+        logger.info("Universe loaded: %s tickers", len(self.symbols))
+
+    def get(self, limit: Optional[int] = None) -> List[str]:
+        if not self.symbols:
+            return DEFAULT_UNIVERSE_FALLBACK[: limit or None]
+        return self.symbols[: limit or None]
+
+    async def refresh_weekly_forever(self) -> None:
+        """
+        Background task: refresh symbols once a week (NASDAQ lists update daily;
+        weekly is a good cadence without being noisy).
+        """
         while True:
-            self.refresh_once()
-            time.sleep(7 * 24 * 3600)  # 7 days
+            try:
+                from src.generate_symbols_file import main as gen_main
+            except Exception:
+                try:
+                    from ..generate_symbols_file import main as gen_main
+                except Exception:
+                    logger.exception("Weekly refresh: failed to import generator.")
+                    await asyncio.sleep(7 * 24 * 3600)
+                    continue
+
+            try:
+                rows = gen_main(write_file=True)
+                if rows:
+                    self.symbols = rows
+                    logger.info("Weekly symbols refresh complete: %s tickers", len(rows))
+            except Exception:
+                logger.exception("Weekly symbols refresh failed.")
+
+            await asyncio.sleep(7 * 24 * 3600)
