@@ -1,109 +1,92 @@
-# src/generate_symbols_file.py
-import argparse
-import time
-from typing import Dict, Iterable, List, Optional, Set
+import os
+import io
+import csv
+import re
 import requests
-from pathlib import Path
+from typing import List
 
-ROBINHOOD_INSTRUMENTS = "https://api.robinhood.com/instruments/"
+NASDAQLISTED_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+OTHERLISTED_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+OUT_PATH = os.getenv("SYMBOLS_FILE", "data/symbols_robinhood.txt")
 
-ALLOWED_US_MICS: Set[str] = {
-    "XNAS",  # NASDAQ
-    "XNGS",  # NASDAQ Global Select
-    "XNYS",  # NYSE
-    "ARCX",  # NYSE Arca
-    "XASE",  # NYSE American
-    "BATS",  # Cboe BZX
-}
+# Heuristics to skip non-common-stock securities
+PREF_PAT = re.compile(r"\bPFD\b|PREFERRED", re.I)
+NOTE_PAT = re.compile(r"NOTE|BOND|DEBENTURE|TRUST|RIGHTS?", re.I)
+WARRANT_PAT = re.compile(r"WARRANT|WTS?\b|\bWT\b", re.I)
+UNIT_PAT = re.compile(r" UNIT[S]?", re.I)
+ADR_PAT = re.compile(r"ADR|AMERICAN DEPOSITARY", re.I)
+FUND_PAT = re.compile(r"FUND|ETF|ETN|TRUST|CLOSED-END", re.I)
+NONCOMMON_PAT = re.compile(r"SPAC|ACQUISITION CORP", re.I)
 
-def fetch_instruments(session: requests.Session) -> Iterable[Dict]:
-    url = ROBINHOOD_INSTRUMENTS
-    params = {"active_instruments_only": "true", "tradable": "true"}
-    while url:
-        r = session.get(url, params=params if url == ROBINHOOD_INSTRUMENTS else None, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        for inst in data.get("results", []):
-            yield inst
-        url = data.get("next")
-        time.sleep(0.03)
+def _fetch(url: str) -> str:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.text
 
-def get_market_mic(session: requests.Session, market_field) -> Optional[str]:
-    if isinstance(market_field, dict):
-        return market_field.get("mic")
-    if isinstance(market_field, str) and market_field.startswith("http"):
-        try:
-            r = session.get(market_field, timeout=20)
-            r.raise_for_status()
-            return r.json().get("mic")
-        except Exception:
-            return None
-    return None
+def _parse_pipe_table(text: str) -> List[dict]:
+    # NASDAQ files are pipe-delimited with a footer line starting with "File Creation Time:"
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("File Creation Time")]
+    reader = csv.DictReader(lines, delimiter="|")
+    return list(reader)
 
-def instrument_is_us_common(inst: Dict, mic: Optional[str], allowed_mics: Set[str]) -> bool:
-    if inst.get("state") != "active":
+def _clean_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    # Strip suffixes used by some feeds (e.g., BRK.B becomes BRK-B elsewhere; keep simple, skip dotted).
+    if any(ch in s for ch in (" ", "/", "^", ".")):
+        return ""
+    return s
+
+def _is_common_stock(row: dict) -> bool:
+    name = row.get("Security Name", "") or row.get("SecurityName", "")
+    etf = (row.get("ETF") or "").upper() == "Y"
+    test_issue = (row.get("Test Issue") or row.get("TestIssue") or "").upper() == "Y"
+    next_shares = (row.get("NextShares") or "").upper() == "Y"
+
+    if etf or test_issue or next_shares:
         return False
-    if not inst.get("tradeable", False):
+
+    # Heuristic filters to avoid preferreds, funds, warrants, units, etc.
+    if any(p.search(name) for p in (PREF_PAT, NOTE_PAT, WARRANT_PAT, UNIT_PAT, ADR_PAT, FUND_PAT, NONCOMMON_PAT)):
         return False
-    if inst.get("type") != "stock":
-        return False
-    if allowed_mics and (mic is None or mic not in allowed_mics):
-        return False
-    sym = (inst.get("symbol") or "").strip().upper()
-    if not sym or not sym.isascii():
-        return False
-    if any(x in sym for x in ["^", " ", "/"]):
-        return False
-    if sym.endswith(("~", ".WI")):
-        return False
+
     return True
 
-def write_symbols(symbols: List[str], out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    uniq = sorted(set(symbols))
-    out_path.write_text("\n".join(uniq) + "\n", encoding="utf-8")
-    print(f"✅ Wrote {len(uniq)} symbols -> {out_path}")
+def _dedupe_sorted(symbols: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in symbols:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    out.sort()
+    return out
 
-def main(argv: Optional[List[str]] = None) -> int:
-    base_dir = Path(__file__).resolve().parent  # .../src
-    default_out = base_dir / ".." / "data" / "symbols_robinhood.txt"
-    default_out = default_out.resolve()
+def generate_symbols() -> List[str]:
+    nasdaq = _parse_pipe_table(_fetch(NASDAQLISTED_URL))
+    other = _parse_pipe_table(_fetch(OTHERLISTED_URL))
+    rows = nasdaq + other
 
-    p = argparse.ArgumentParser(description="Generate U.S. common stock symbols from Robinhood.")
-    p.add_argument("--out", default=str(default_out),
-                   help=f"Output file (default: {default_out})")
-    p.add_argument("--include-otc", action="store_true",
-                   help="If set, include OTC/grey (skip MIC filtering).")
-    args = p.parse_args(argv)
+    syms = []
+    for r in rows:
+        s = _clean_symbol(r.get("Symbol") or r.get("ACT Symbol") or "")
+        if not s:
+            continue
+        if not _is_common_stock(r):
+            continue
+        syms.append(s)
 
-    allowed_mics = set() if args.include_otc else ALLOWED_US_MICS
+    return _dedupe_sorted(syms)
 
-    sess = requests.Session()
-    syms: List[str] = []
-    total = 0
-    mic_cache: dict[str, Optional[str]] = {}
-
-    print("🔎 Fetching instruments from Robinhood…")
-    for inst in fetch_instruments(sess):
-        total += 1
-        mfield = inst.get("market")
-        mic = None
-        key = None
-        if isinstance(mfield, str):
-            key = mfield
-        if key and key in mic_cache:
-            mic = mic_cache[key]
-        else:
-            mic = get_market_mic(sess, mfield)
-            if key:
-                mic_cache[key] = mic
-
-        if instrument_is_us_common(inst, mic, allowed_mics):
-            syms.append(inst["symbol"].strip().upper())
-
-    print(f"Found {len(syms)} candidate symbols out of {total} instruments.")
-    write_symbols(syms, Path(args.out))
-    return 0
+def main(write_file: bool = True) -> List[str]:
+    syms = generate_symbols()
+    if write_file:
+        os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+        with open(OUT_PATH, "w", encoding="utf-8") as f:
+            f.write("# Auto-generated; source: NASDAQ Trader (NASDAQ/NYSE/AMEX). No OTC/ETF/Warrant/Units.\n")
+            for s in syms:
+                f.write(s + "\n")
+    return syms
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    out = main(write_file=True)
+    print(f"Generated {len(out)} symbols -> {OUT_PATH}")
