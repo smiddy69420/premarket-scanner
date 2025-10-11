@@ -4,28 +4,22 @@ services:
     env: python
     plan: starter
     autoDeploy: true
+
     buildCommand: pip install -r requirements.txt
     startCommand: python src/bot.py
+
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.6
-      - key: LOG_LEVEL
-        value: DEBUG
-      - key: KEEP_ALIVE
-        value: "True"
-      - key: CACHE_DIR
-        value: /tmp/premarket_cache
-      - key: TZ
-        value: America/New_York
       - key: DISCORD_BOT_TOKEN
         sync: false
       - key: DISCORD_GUILD_ID
         sync: false
       - key: DISCORD_CHANNEL_ID
         sync: false
-      # Point the bot at the symbols file we maintain automatically.
+      - key: LOG_LEVEL
+        value: DEBUG
+      - key: KEEP_ALIVE
+        value: "true"
       - key: SYMBOLS_FILE
         value: data/symbols_robinhood.txt
-      # Leave ALL_TICKERS empty (UniverseManager will ignore it if you don't set it)
-      - key: ALL_TICKERS
-        value:
+      - key: TZ
+        value: America/New_York
